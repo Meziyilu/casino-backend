@@ -1,16 +1,30 @@
 from fastapi import FastAPI
-import os
+from fastapi.middleware.cors import CORSMiddleware
+import os, psycopg
 
 app = FastAPI()
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # 先放寬方便前端測試，上線再收斂
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+@app.get("/")
+def root():
+    return {"message": "casino-backend running"}
 
 @app.get("/health")
 def health():
     return {"status": "ok"}
 
-# 測試資料庫連線
-@app.get("/db-ping")
-def db_ping():
-    db_url = os.getenv("DATABASE_URL")
-    if db_url:
-        return {"db_url": db_url, "message": "DATABASE_URL loaded"}
-    return {"error": "DATABASE_URL not set"}
+@app.get("/db-check")
+def db_check():
+    url = os.getenv("DATABASE_URL")
+    if not url:
+        return {"ok": False, "reason": "DATABASE_URL missing"}
+    with psycopg.connect(url) as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1;")
+            one = cur.fetchone()[0]
+    return {"ok": one == 1}
