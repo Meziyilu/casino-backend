@@ -1,30 +1,44 @@
+import psycopg, os
+
+def init_db():
+    url = os.getenv("DATABASE_URL")
+    with psycopg.connect(url, autocommit=True) as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+              id SERIAL PRIMARY KEY,
+              tg_id TEXT UNIQUE,
+              nickname TEXT,
+              balance BIGINT DEFAULT 0,
+              created_at TIMESTAMPTZ DEFAULT now()
+            );
+            """)
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS rounds (
+              id BIGSERIAL PRIMARY KEY,
+              round_no INT NOT NULL,
+              opened_at TIMESTAMPTZ DEFAULT now(),
+              player_total INT,
+              banker_total INT,
+              outcome TEXT
+            );
+            """)
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS bets (
+              id BIGSERIAL PRIMARY KEY,
+              user_id INT REFERENCES users(id),
+              round_no INT NOT NULL,
+              side TEXT,
+              amount BIGINT NOT NULL,
+              created_at TIMESTAMPTZ DEFAULT now()
+            );
+            """)
+
+# 在 FastAPI 啟動事件呼叫
 from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
-import os, psycopg
 
 app = FastAPI()
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # 先放寬方便前端測試，上線再收斂
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
 
-@app.get("/")
-def root():
-    return {"message": "casino-backend running"}
-
-@app.get("/health")
-def health():
-    return {"status": "ok"}
-
-@app.get("/db-check")
-def db_check():
-    url = os.getenv("DATABASE_URL")
-    if not url:
-        return {"ok": False, "reason": "DATABASE_URL missing"}
-    with psycopg.connect(url) as conn:
-        with conn.cursor() as cur:
-            cur.execute("SELECT 1;")
-            one = cur.fetchone()[0]
-    return {"ok": one == 1}
+@app.on_event("startup")
+def startup_event():
+    init_db()
