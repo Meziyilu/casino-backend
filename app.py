@@ -1,88 +1,34 @@
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
-import os
-import psycopg
+# --- 這些 import 放在檔案頂部 ---
+from pydantic import BaseModel
+from datetime import datetime, timedelta, timezone
+from passlib.context import CryptContext
+import jwt  # PyJWT
+from fastapi import HTTPException, Depends, Header
 
-APP_NAME = "casino-backend"
+# JWT 與密碼雜湊設定
+pwd_ctx = CryptContext(schemes=["bcrypt"], deprecated="auto")
+JWT_ALG = "HS256"
+JWT_EXP_MIN = 60 * 24 * 7  # 7天
+SECRET = os.getenv("SECRET_KEY", "dev-secret")  # 記得在 Render 設定 SECRET_KEY
 
-app = FastAPI(title=APP_NAME)
+def hash_pw(p: str) -> str:
+    return pwd_ctx.hash(p)
 
-# 開 CORS（先放寬，之後可改白名單）
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+def verify_pw(p: str, h: str) -> bool:
+    return pwd_ctx.verify(p, h)
 
-DDL_USERS = """
-CREATE TABLE IF NOT EXISTS users (
-  id SERIAL PRIMARY KEY,
-  tg_id TEXT UNIQUE,
-  nickname TEXT,
-  balance BIGINT DEFAULT 0,
-  created_at TIMESTAMPTZ DEFAULT now()
-);
-"""
+def make_token(user_id: int, username: str) -> str:
+    now = datetime.now(timezone.utc)
+    payload = {
+        "sub": str(user_id),
+        "username": username,
+        "iat": int(now.timestamp()),
+        "exp": int((now + timedelta(minutes=JWT_EXP_MIN)).timestamp())
+    }
+    return jwt.encode(payload, SECRET, algorithm=JWT_ALG)
 
-DDL_ROUNDS = """
-CREATE TABLE IF NOT EXISTS rounds (
-  id BIGSERIAL PRIMARY KEY,
-  round_no INT NOT NULL,
-  opened_at TIMESTAMPTZ DEFAULT now(),
-  player_total INT,
-  banker_total INT,
-  outcome TEXT  -- 'player' | 'banker' | 'tie'
-);
-"""
-
-DDL_BETS = """
-CREATE TABLE IF NOT EXISTS bets (
-  id BIGSERIAL PRIMARY KEY,
-  user_id INT REFERENCES users(id),
-  round_no INT NOT NULL,
-  side TEXT,        -- 'player' | 'banker' | 'tie'
-  amount BIGINT NOT NULL,
-  created_at TIMESTAMPTZ DEFAULT now()
-);
-"""
-
-def init_db():
-    url = os.getenv("DATABASE_URL")
-    if not url:
-        print("[init_db] DATABASE_URL is not set; skip migrations.")
-        return
-
-    # psycopg v3：DDL 需要 commit；用 autocommit=True 最簡單
-    with psycopg.connect(url, autocommit=True) as conn:
-        with conn.cursor() as cur:
-            cur.execute(DDL_USERS)
-            cur.execute(DDL_ROUNDS)
-            cur.execute(DDL_BETS)
-    print("[init_db] Tables ensured: users, rounds, bets")
-
-@app.on_event("startup")
-def on_startup():
-    init_db()
-
-@app.get("/")
-def root():
-    return {"message": f"{APP_NAME} running"}
-
-@app.get("/health")
-def health():
-    return {"status": "ok"}
-
-@app.get("/db-check")
-def db_check():
-    url = os.getenv("DATABASE_URL")
-    if not url:
-        return {"ok": False, "reason": "DATABASE_URL missing"}
+def parse_token(token: str):
     try:
-        with psycopg.connect(url) as conn:
-            with conn.cursor() as cur:
-                cur.execute("SELECT 1;")
-                one = cur.fetchone()[0]
-        return {"ok": one == 1}
-    except Exception as e:
-        return {"ok": False, "reason": str(e)}
+        return jwt.decode(token, SECRET, algorithms=[JWT_ALG])
+    except jwt.PyJWTError:
+        raise HTTPException(status_code=401, detail="Invalid or expired token")
