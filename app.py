@@ -10,11 +10,12 @@ import jwt  # PyJWT
 
 APP_NAME = "casino-backend"
 
-# ====== FastAPI & CORS ======
+# ================= FastAPI & CORS =================
 app = FastAPI(title=APP_NAME)
 
-# 上線請改成你的前端網域
+# 上線請保留實際前端網域；開發可暫時加入 localhost
 ALLOWED_ORIGINS = [
+    "https://casino-frontend-pya7.onrender.com",
     "https://topz0705.com",
     "https://www.topz0705.com",
     "http://localhost:5173",
@@ -22,13 +23,13 @@ ALLOWED_ORIGINS = [
 ]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],   # 開發中可暫用 ["*"]
+    allow_origins=ALLOWED_ORIGINS,   # 若測試不通，可暫改為 ["*"] 再收斂
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ====== DB DDL ======
+# ================= DB DDL =================
 DDL_USERS = """
 CREATE TABLE IF NOT EXISTS users (
   id SERIAL PRIMARY KEY,
@@ -67,7 +68,7 @@ def init_db():
         print("[init_db] DATABASE_URL is not set; skip migrations.")
         return
 
-    # DDL 需 autocommit
+    # DDL 建議 autocommit
     with psycopg.connect(url, autocommit=True) as conn:
         with conn.cursor() as cur:
             # 建表
@@ -75,26 +76,27 @@ def init_db():
             cur.execute(DDL_ROUNDS)
             cur.execute(DDL_BETS)
 
-            # 🔧 修正語法：不能寫 ALTER TABLE IF NOT EXISTS
+            # 追加欄位（⚠ 不能寫 ALTER TABLE IF NOT EXISTS）
             cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS username TEXT;")
             cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS password_hash TEXT;")
 
-            # 唯一索引（允許多個 NULL，不擋未設定）
+            # 唯一索引（允許多個 NULL，不擋未設定者）
             cur.execute("""
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_users_username
                 ON users(username);
             """)
-    print("[init_db] ensured tables/columns: users(username, password_hash), rounds, bets")
+
+    print("[init_db] ensured tables/columns: users(username,password_hash), rounds, bets")
 
 @app.on_event("startup")
 def on_startup():
     init_db()
 
-# ====== Security (password & JWT) ======
+# ================= Security (password & JWT) =================
 pwd_ctx = CryptContext(schemes=["bcrypt"], deprecated="auto")
 JWT_ALG = "HS256"
 JWT_EXP_MIN = 60 * 24 * 7  # 7 天
-SECRET = os.getenv("SECRET_KEY", "dev-secret")  # 在 Render 設定 SECRET_KEY
+SECRET = os.getenv("SECRET_KEY", "dev-secret")  # Render 設定 SECRET_KEY
 
 def hash_pw(p: str) -> str:
     return pwd_ctx.hash(p)
@@ -121,7 +123,7 @@ def parse_token(token: str):
     except jwt.PyJWTError:
         raise HTTPException(status_code=401, detail="Invalid or expired token")
 
-# 依賴：取得目前使用者
+# 取得目前登入者（Authorization: Bearer <token>）
 def get_current_user(authorization: str = Header(None)):
     if not authorization or not authorization.lower().startswith("bearer "):
         raise HTTPException(status_code=401, detail="Missing Authorization header")
@@ -129,7 +131,12 @@ def get_current_user(authorization: str = Header(None)):
     data = parse_token(token)
     return {"user_id": int(data["sub"]), "username": data["username"]}
 
-# ====== Schemas ======
+# 管理員白名單（環境變數 ADMIN_USERS=admin,topz0705）
+def get_admin_usernames() -> set[str]:
+    raw = os.getenv("ADMIN_USERS", "")
+    return set(u.strip() for u in raw.split(",") if u.strip())
+
+# ================= Schemas =================
 class RegisterIn(BaseModel):
     username: str
     password: str
@@ -143,7 +150,11 @@ class TokenOut(BaseModel):
     access_token: str
     token_type: str = "bearer"
 
-# ====== Basic Routes ======
+class GrantIn(BaseModel):
+    username: str
+    amount: int  # 正數加、負數扣
+
+# ================= Basic Routes =================
 @app.get("/")
 def root():
     return {"message": f"{APP_NAME} running"}
@@ -166,7 +177,7 @@ def db_check():
     except Exception as e:
         return {"ok": False, "reason": str(e)}
 
-# ====== Auth APIs ======
+# ================= Auth =================
 @app.post("/auth/register", response_model=TokenOut)
 def register(body: RegisterIn):
     url = os.getenv("DATABASE_URL")
@@ -174,11 +185,9 @@ def register(body: RegisterIn):
         raise HTTPException(500, "DATABASE_URL not set")
     with psycopg.connect(url, autocommit=True) as conn:
         with conn.cursor() as cur:
-            # 檢查是否已有相同 username
             cur.execute("SELECT id FROM users WHERE username=%s", (body.username,))
             if cur.fetchone():
                 raise HTTPException(status_code=409, detail="Username already exists")
-            # 建立使用者
             cur.execute(
                 "INSERT INTO users (username, password_hash, nickname) VALUES (%s,%s,%s) RETURNING id",
                 (body.username, hash_pw(body.password), body.nickname),
@@ -204,10 +213,7 @@ def login(body: LoginIn):
 def me(user=Depends(get_current_user)):
     return {"id": user["user_id"], "username": user["username"]}
 
-# ==== Balance APIs ====
-from typing import Optional
-from fastapi import Body
-
+# ================= Balance =================
 @app.get("/balance")
 def get_balance(user=Depends(get_current_user)):
     url = os.getenv("DATABASE_URL")
@@ -219,29 +225,22 @@ def get_balance(user=Depends(get_current_user)):
                 raise HTTPException(404, "User not found")
             return {"balance": int(row[0] or 0)}
 
-# 簡單的管理者加點數：用環境變數 ADMIN_TOKEN 做保護
-ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "")
-
-class GrantIn(BaseModel):
-    username: str
-    amount: int  # 正數加點、負數扣點
-
+# ================= Admin (JWT + 白名單) =================
 @app.post("/admin/grant")
-def admin_grant(
-    body: GrantIn,
-    x_admin_token: Optional[str] = Header(None, alias="X-Admin-Token"),
-):
-    if not ADMIN_TOKEN or x_admin_token != ADMIN_TOKEN:
-        raise HTTPException(401, "Invalid admin token")
+def admin_grant(body: GrantIn, user=Depends(get_current_user)):
+    admins = get_admin_usernames()
+    if user["username"] not in admins:
+        raise HTTPException(403, "Forbidden: not admin")
     if body.amount == 0:
         raise HTTPException(400, "amount cannot be 0")
 
     url = os.getenv("DATABASE_URL")
     with psycopg.connect(url, autocommit=True) as conn:
         with conn.cursor() as cur:
-            # 直接以 username 對應修改餘額
-            cur.execute("UPDATE users SET balance = COALESCE(balance,0) + %s WHERE username=%s RETURNING balance",
-                        (body.amount, body.username))
+            cur.execute(
+                "UPDATE users SET balance = COALESCE(balance,0) + %s WHERE username=%s RETURNING balance",
+                (body.amount, body.username),
+            )
             row = cur.fetchone()
             if not row:
                 raise HTTPException(404, "User not found")
