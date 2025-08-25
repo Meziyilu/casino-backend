@@ -23,7 +23,7 @@ ALLOWED_ORIGINS = [
 ]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS,   # 若測試不通，可暫改為 ["*"] 再收斂
+    allow_origins=["*"],   # 若測試不通，可暫改為 ["*"] 再收斂
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
