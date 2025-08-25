@@ -21,7 +21,12 @@ ALLOWED_ORIGINS = [
 ]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS,
+    allow_origins=[
+        "https://topz0705.com",          # 你的前端正式網址
+        "https://casino-frontend.onrender.com", # 前端測試網址
+        "http://localhost:5173"          # 開發用 Vite 預設 port
+    ],
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
