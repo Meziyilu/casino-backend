@@ -1,14 +1,21 @@
-# render.yaml
 services:
   - type: web
     name: casino-backend
-    env: docker
-    plan: starter            # $7/月，不休眠
-    dockerfilePath: ./Dockerfile
-    dockerContext: .
-    autoDeploy: true
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python3 -m uvicorn app:app --host 0.0.0.0 --port $PORT
     envVars:
       - key: DATABASE_URL
-        sync: false          # 去 Render 介面貼你的 External DB URL
+        sync: false
       - key: SECRET_KEY
         generateValue: true
+      - key: ADMIN_USERS
+        value: "admin"
+      - key: AUTO_DEAL
+        value: "1"
+      - key: AUTO_BET_SEC
+        value: "60"
+      - key: AUTO_REVEAL_SEC
+        value: "15"
+      - key: AUTO_GAP_SEC
+        value: "3"

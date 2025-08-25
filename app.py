@@ -17,23 +17,21 @@ app = FastAPI(title=APP_NAME)
 
 # ======== CORS ========
 ALLOWED_ORIGINS = [
-    "https://casino-frontend-pya7.onrender.com",
-    "https://topz0705.com", "https://www.topz0705.com",
-    "http://localhost:5173", "http://127.0.0.1:5173",
+    "*",  # 你也可以收斂為：前端正式網域，例如 https://topz0705.com
 ]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS,  # 測試不通可暫時改 ["*"] 再收斂
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 # ======== Auto dealer config ========
-AUTO_DEAL = os.getenv("AUTO_DEAL", "0") == "1"          # 置 1 啟用自動開局
-AUTO_BET_SEC = int(os.getenv("AUTO_BET_SEC", "60"))     # 下注秒數
-AUTO_REVEAL_SEC = int(os.getenv("AUTO_REVEAL_SEC", "15"))  # 前端開獎動畫時間（等待）
-AUTO_GAP_SEC = int(os.getenv("AUTO_GAP_SEC", "3"))      # 動畫後緩衝到下一局
+AUTO_DEAL = os.getenv("AUTO_DEAL", "1") == "1"
+AUTO_BET_SEC = int(os.getenv("AUTO_BET_SEC", "60"))
+AUTO_REVEAL_SEC = int(os.getenv("AUTO_REVEAL_SEC", "15"))
+AUTO_GAP_SEC = int(os.getenv("AUTO_GAP_SEC", "3"))
 
 # ======== DB schema ========
 DDL_USERS = """
@@ -183,8 +181,8 @@ def register(body: RegisterIn):
             if cur.fetchone():
                 raise HTTPException(409, "Username already exists")
             cur.execute(
-                "INSERT INTO users (username, password_hash, nickname) VALUES (%s,%s,%s) RETURNING id",
-                (body.username, hash_pw(body.password), body.nickname),
+                "INSERT INTO users (username, password_hash, nickname, balance) VALUES (%s,%s,%s, %s) RETURNING id",
+                (body.username, hash_pw(body.password), body.nickname, 10000),
             )
             user_id = cur.fetchone()[0]
     return TokenOut(access_token=make_token(user_id, body.username))
@@ -265,6 +263,15 @@ def rounds_current():
             r = get_open_round(cur)
             now = datetime.now(timezone.utc)
             if not r:
+                # 也可能剛結束在 reveal 期間；仍回 closed 狀態
+                cur.execute("""
+                    SELECT round_no, status, betting_deadline FROM rounds
+                    WHERE outcome IS NOT NULL
+                    ORDER BY round_no DESC LIMIT 1
+                """)
+                last = cur.fetchone()
+                if last:
+                    return {"round_no": last[0], "status": "closed", "server_time": now.isoformat(), "betting_deadline": None, "remain_sec": 0}
                 return {"round_no": None, "status": "idle", "server_time": now.isoformat(), "betting_deadline": None, "remain_sec": 0}
             _, round_no, opened_at, pt, bt, outcome, status, ddl, p3, b3 = r
             remain = int(max(0, (ddl - now).total_seconds())) if ddl else None
