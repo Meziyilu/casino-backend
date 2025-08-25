@@ -2,15 +2,21 @@ services:
   - type: web
     name: casino-backend
     env: python
+    region: oregon
     buildCommand: pip install -r requirements.txt
     startCommand: python3 -m uvicorn app:app --host 0.0.0.0 --port $PORT
+    autoDeploy: true
     envVars:
       - key: DATABASE_URL
         sync: false
       - key: SECRET_KEY
-        generateValue: true
+        sync: false
       - key: ADMIN_USERS
-        value: "admin"
+        value: admin,meziyilu,topz0705
+      - key: ADMIN_TOKEN
+        sync: false
+      - key: ALLOWED_ORIGINS
+        value: https://topz0705.com,https://casino-frontend-pya7.onrender.com,http://localhost:5173
       - key: AUTO_DEAL
         value: "1"
       - key: AUTO_BET_SEC
