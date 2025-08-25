@@ -13,17 +13,16 @@ APP_NAME = "casino-backend"
 # ====== FastAPI & CORS ======
 app = FastAPI(title=APP_NAME)
 
-# 上線時請改成你的前端網域白名單
+# 上線請改成你的前端網域
 ALLOWED_ORIGINS = [
     "https://topz0705.com",
     "https://www.topz0705.com",
-    # 開發時可暫時允許本機
     "http://localhost:5173",
     "http://127.0.0.1:5173",
 ]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS,   # 若要完全開放可暫時用 ["*"]
+    allow_origins=ALLOWED_ORIGINS,   # 開發中可暫用 ["*"]
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -68,23 +67,19 @@ def init_db():
         print("[init_db] DATABASE_URL is not set; skip migrations.")
         return
 
-    # DDL 需 autocommit 才會立即生效
+    # DDL 需 autocommit
     with psycopg.connect(url, autocommit=True) as conn:
         with conn.cursor() as cur:
             # 建表
             cur.execute(DDL_USERS)
             cur.execute(DDL_ROUNDS)
             cur.execute(DDL_BETS)
-            # 追加欄位（若不存在）
-            cur.execute("""
-                ALTER TABLE IF NOT EXISTS users
-                ADD COLUMN IF NOT EXISTS username TEXT;
-            """)
-            cur.execute("""
-                ALTER TABLE IF NOT EXISTS users
-                ADD COLUMN IF NOT EXISTS password_hash TEXT;
-            """)
-            # 唯一索引（允許多個 NULL，不會擋未設定者）
+
+            # 🔧 修正語法：不能寫 ALTER TABLE IF NOT EXISTS
+            cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS username TEXT;")
+            cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS password_hash TEXT;")
+
+            # 唯一索引（允許多個 NULL，不擋未設定）
             cur.execute("""
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_users_username
                 ON users(username);
@@ -99,7 +94,7 @@ def on_startup():
 pwd_ctx = CryptContext(schemes=["bcrypt"], deprecated="auto")
 JWT_ALG = "HS256"
 JWT_EXP_MIN = 60 * 24 * 7  # 7 天
-SECRET = os.getenv("SECRET_KEY", "dev-secret")  # 記得在 Render 設定 SECRET_KEY
+SECRET = os.getenv("SECRET_KEY", "dev-secret")  # 在 Render 設定 SECRET_KEY
 
 def hash_pw(p: str) -> str:
     return pwd_ctx.hash(p)
