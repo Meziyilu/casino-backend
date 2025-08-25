@@ -13,35 +13,40 @@ import jwt  # PyJWT
 
 APP_NAME = "casino-backend"
 
-app = FastAPI(title=APP_NAME)
+# ================= CORS =================
+def get_allowed_origins() -> list[str]:
+    # 允許以環境變數覆寫，逗號分隔
+    raw = os.getenv("ALLOWED_ORIGINS", "")
+    if raw.strip():
+        return [o.strip() for o in raw.split(",") if o.strip()]
+    # 預設：你的正式網域 + Render 前端 + 本機開發
+    return [
+        "https://topz0705.com",
+        "https://casino-frontend-pya7.onrender.com",
+        "http://localhost:5173",
+    ]
 
-# ======== CORS ========
-ALLOWED_ORIGINS = [
-    "*",  # 你也可以收斂為：前端正式網域，例如 https://topz0705.com
-]
+app = FastAPI(title=APP_NAME)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "https://topz0705.com",          # 你的前端正式網址
-        "https://casino-frontend.onrender.com", # 前端測試網址
-        "http://localhost:5173"          # 開發用 Vite 預設 port
-    ],
-    allow_origins=["*"],
+    allow_origins=get_allowed_origins(),   # ⚠️ 不要用 "*"
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ======== Auto dealer config ========
+# ================= Auto dealer config =================
 AUTO_DEAL = os.getenv("AUTO_DEAL", "1") == "1"
-AUTO_BET_SEC = int(os.getenv("AUTO_BET_SEC", "60"))
-AUTO_REVEAL_SEC = int(os.getenv("AUTO_REVEAL_SEC", "15"))
-AUTO_GAP_SEC = int(os.getenv("AUTO_GAP_SEC", "3"))
+AUTO_BET_SEC = int(os.getenv("AUTO_BET_SEC", "60"))      # 下注時間
+AUTO_REVEAL_SEC = int(os.getenv("AUTO_REVEAL_SEC", "15"))# 動畫時間（前端）
+AUTO_GAP_SEC = int(os.getenv("AUTO_GAP_SEC", "3"))       # 緩衝
 
-# ======== DB schema ========
+# ================= DB schema =================
 DDL_USERS = """
 CREATE TABLE IF NOT EXISTS users (
   id SERIAL PRIMARY KEY,
+  username TEXT UNIQUE,
+  password_hash TEXT,
   tg_id TEXT UNIQUE,
   nickname TEXT,
   balance BIGINT DEFAULT 0,
@@ -55,7 +60,11 @@ CREATE TABLE IF NOT EXISTS rounds (
   opened_at TIMESTAMPTZ DEFAULT now(),
   player_total INT,
   banker_total INT,
-  outcome TEXT
+  outcome TEXT,
+  status TEXT DEFAULT 'open',
+  betting_deadline TIMESTAMPTZ,
+  player_draw3 BOOLEAN,
+  banker_draw3 BOOLEAN
 );
 """
 DDL_BETS = """
@@ -65,6 +74,7 @@ CREATE TABLE IF NOT EXISTS bets (
   round_no INT NOT NULL,
   side TEXT,
   amount BIGINT NOT NULL,
+  bet_type TEXT DEFAULT 'main',
   created_at TIMESTAMPTZ DEFAULT now()
 );
 """
@@ -79,33 +89,16 @@ def init_db():
             cur.execute(DDL_USERS)
             cur.execute(DDL_ROUNDS)
             cur.execute(DDL_BETS)
-            cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS username TEXT;")
-            cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS password_hash TEXT;")
-            cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_username ON users(username);")
-    print("[init_db] base tables ensured")
-
-def ensure_schema_ext():
-    url = os.getenv("DATABASE_URL")
-    if not url:
-        return
-    with psycopg.connect(url, autocommit=True) as conn:
-        with conn.cursor() as cur:
-            # rounds：狀態、下注截止、補牌旗標
-            cur.execute("ALTER TABLE rounds ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'open'")
-            cur.execute("ALTER TABLE rounds ADD COLUMN IF NOT EXISTS betting_deadline TIMESTAMPTZ")
-            cur.execute("ALTER TABLE rounds ADD COLUMN IF NOT EXISTS player_draw3 BOOLEAN")
-            cur.execute("ALTER TABLE rounds ADD COLUMN IF NOT EXISTS banker_draw3 BOOLEAN")
-            # bets：副注
-            cur.execute("ALTER TABLE bets ADD COLUMN IF NOT EXISTS bet_type TEXT DEFAULT 'main'")
             # 索引
+            cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_username ON users(username)")
             cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_rounds_round_no ON rounds(round_no)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_rounds_status ON rounds(status)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_bets_round_no ON bets(round_no)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_bets_user_round ON bets(user_id, round_no)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_bets_composite ON bets(round_no, bet_type)")
-    print("[ensure_schema_ext] done")
+    print("[init_db] schema ensured")
 
-# ======== Security (password & JWT) ========
+# ================= Security (password & JWT) =================
 pwd_ctx = CryptContext(schemes=["bcrypt"], deprecated="auto")
 JWT_ALG = "HS256"
 JWT_EXP_MIN = 60 * 24 * 7  # 7 days
@@ -147,7 +140,7 @@ def get_admin_usernames() -> Set[str]:
     raw = os.getenv("ADMIN_USERS", "")
     return set(u.strip() for u in raw.split(",") if u.strip())
 
-# ======== Schemas ========
+# ================= Pydantic Schemas =================
 class RegisterIn(BaseModel):
     username: str
     password: str
@@ -165,7 +158,26 @@ class GrantIn(BaseModel):
     username: str
     amount: int
 
-# ======== Health ========
+class BetIn(BaseModel):
+    side: str   # 'player'|'banker'|'tie' 或副注 'player_pair'|'banker_pair'|'any_pair'|'perfect_pair'
+    amount: int
+
+class OpenIn(BaseModel):
+    duration_sec: int = 20
+
+class SettleIn(BaseModel):
+    round_no: Optional[int] = None
+    player_total: int
+    banker_total: int
+    outcome: str  # 'player'|'banker'|'tie'
+    player_pair: bool = False
+    banker_pair: bool = False
+    any_pair: bool = False
+    perfect_pair: bool = False
+    player_draw3: Optional[bool] = None
+    banker_draw3: Optional[bool] = None
+
+# ================= Health =================
 @app.get("/")
 def root():
     return {"message": f"{APP_NAME} running"}
@@ -174,9 +186,9 @@ def root():
 def health():
     return {"status": "ok"}
 
-# ======== Auth ========
+# ================= Auth =================
 @app.post("/auth/register", response_model=TokenOut)
-def register(body: RegisterIn):
+def auth_register(body: RegisterIn):
     url = os.getenv("DATABASE_URL")
     if not url:
         raise HTTPException(500, "DATABASE_URL not set")
@@ -186,14 +198,14 @@ def register(body: RegisterIn):
             if cur.fetchone():
                 raise HTTPException(409, "Username already exists")
             cur.execute(
-                "INSERT INTO users (username, password_hash, nickname, balance) VALUES (%s,%s,%s, %s) RETURNING id",
+                "INSERT INTO users (username, password_hash, nickname, balance) VALUES (%s,%s,%s,%s) RETURNING id",
                 (body.username, hash_pw(body.password), body.nickname, 10000),
             )
             user_id = cur.fetchone()[0]
     return TokenOut(access_token=make_token(user_id, body.username))
 
 @app.post("/auth/login", response_model=TokenOut)
-def login(body: LoginIn):
+def auth_login(body: LoginIn):
     url = os.getenv("DATABASE_URL")
     if not url:
         raise HTTPException(500, "DATABASE_URL not set")
@@ -206,12 +218,20 @@ def login(body: LoginIn):
             user_id = row[0]
     return TokenOut(access_token=make_token(user_id, body.username))
 
+# ---- 舊路由別名（與 /auth/* 相同邏輯）----
+@app.post("/register", response_model=TokenOut)
+def legacy_register(body: RegisterIn):
+    return auth_register(body)
+
+@app.post("/login", response_model=TokenOut)
+def legacy_login(body: LoginIn):
+    return auth_login(body)
+
 @app.get("/me")
 def me(user=Depends(get_current_user)):
     admins = get_admin_usernames()
     return {"id": user["user_id"], "username": user["username"], "is_admin": user["username"] in admins}
 
-# ======== Balance ========
 @app.get("/balance")
 def get_balance(user=Depends(get_current_user)):
     url = os.getenv("DATABASE_URL")
@@ -223,7 +243,7 @@ def get_balance(user=Depends(get_current_user)):
                 raise HTTPException(404, "User not found")
             return {"balance": int(row[0] or 0)}
 
-# ======== Admin: grant ========
+# ================= Admin: 發幣 =================
 @app.post("/admin/grant")
 def admin_grant(body: GrantIn, user=Depends(get_current_user)):
     admins = get_admin_usernames()
@@ -243,7 +263,7 @@ def admin_grant(body: GrantIn, user=Depends(get_current_user)):
                 raise HTTPException(404, "User not found")
             return {"username": body.username, "balance": int(row[0])}
 
-# ======== Helpers: rounds ========
+# ================= Helpers: rounds =================
 def get_open_round(cur):
     cur.execute("""
         SELECT id, round_no, opened_at, player_total, banker_total, outcome, status, betting_deadline,
@@ -259,7 +279,7 @@ def next_round_no(cur) -> int:
     cur.execute("SELECT COALESCE(MAX(round_no), 0) FROM rounds")
     return int(cur.fetchone()[0] or 0) + 1
 
-# ======== 桌況 / 倒數 ========
+# ================= 桌況 / 倒數 =================
 @app.get("/rounds/current")
 def rounds_current():
     url = os.getenv("DATABASE_URL")
@@ -268,7 +288,7 @@ def rounds_current():
             r = get_open_round(cur)
             now = datetime.now(timezone.utc)
             if not r:
-                # 也可能剛結束在 reveal 期間；仍回 closed 狀態
+                # 可能剛結束在 reveal/gap 期間
                 cur.execute("""
                     SELECT round_no, status, betting_deadline FROM rounds
                     WHERE outcome IS NOT NULL
@@ -288,10 +308,7 @@ def rounds_current():
                 "remain_sec": remain,
             }
 
-# ======== Admin: 開/關 注 ========
-class OpenIn(BaseModel):
-    duration_sec: int = 20
-
+# ================= Admin: 開/關 注 =================
 @app.post("/admin/open-round")
 def admin_open_round(body: OpenIn, user=Depends(get_current_user)):
     admins = get_admin_usernames()
@@ -327,11 +344,7 @@ def admin_close_round(user=Depends(get_current_user)):
             cur.execute("UPDATE rounds SET status='closed' WHERE id=%s", (rid,))
             return {"ok": True, "round_no": round_no}
 
-# ======== Bet（主注/副注） ========
-class BetIn(BaseModel):
-    side: str   # 'player'|'banker'|'tie'|'player_pair'|'banker_pair'|'any_pair'|'perfect_pair'
-    amount: int
-
+# ================= Bet（主注/副注） =================
 ALLOWED_SIDES = {"player","banker","tie","player_pair","banker_pair","any_pair","perfect_pair"}
 
 @app.post("/bet")
@@ -374,7 +387,7 @@ def place_bet(body: BetIn, user=Depends(get_current_user)):
         conn.commit()
     return {"ok": True, "round_no": round_no}
 
-# ======== 歷史（含補牌旗標） ========
+# ================= 歷史（含補牌旗標） =================
 @app.get("/rounds/last10")
 def last10():
     url = os.getenv("DATABASE_URL")
@@ -401,19 +414,7 @@ def last10():
         })
     return {"rows": data}
 
-# ======== 結算（真實賠率 + 對子） ========
-class SettleIn(BaseModel):
-    round_no: Optional[int] = None
-    player_total: int
-    banker_total: int
-    outcome: str  # 'player'|'banker'|'tie'
-    player_pair: bool = False
-    banker_pair: bool = False
-    any_pair: bool = False
-    perfect_pair: bool = False
-    player_draw3: Optional[bool] = None
-    banker_draw3: Optional[bool] = None
-
+# ================= 結算（真實賠率 + 對子） =================
 MAIN_ODDS = {"player": 1.0, "banker": 0.95, "tie": 8.0}
 PAIR_ODDS = {"player_pair": 11.0, "banker_pair": 11.0, "any_pair": 5.0, "perfect_pair": 25.0}
 
@@ -491,7 +492,7 @@ def admin_settle_round(body: SettleIn, user=Depends(get_current_user)):
 
     return {"ok": True, "round_no": round_no, "outcome": outcome, "payout_done": True}
 
-# ======== Auto dealer（背景） ========
+# ================= Auto dealer（背景） =================
 LOCK_KEY = 987654321
 def try_take_lock(cur) -> bool:
     cur.execute("SELECT pg_try_advisory_lock(%s)", (LOCK_KEY,))
@@ -527,7 +528,7 @@ async def auto_dealer_loop():
         return
     while True:
         try:
-            # 取得鎖 & 修正任何逾時的 open 局
+            # 取得鎖 & 修復逾時 open 局
             with psycopg.connect(url, autocommit=True) as conn:
                 with conn.cursor() as cur:
                     if not try_take_lock(cur):
@@ -543,7 +544,7 @@ async def auto_dealer_loop():
                     now = datetime.now(timezone.utc)
 
                     if row and row[2]=='open' and row[3] and now >= row[3]:
-                        # 補關單 + 結算
+                        # 關單 + 結算
                         cur.execute("UPDATE rounds SET status='closed' WHERE id=%s", (row[0],))
                         outcome = random_outcome()
                         pt, bt = random_totals(outcome)
@@ -581,7 +582,7 @@ async def auto_dealer_loop():
                         for uid, add in pay_map.items():
                             cur.execute("UPDATE users SET balance = COALESCE(balance,0) + %s WHERE id=%s", (add, uid))
 
-                    # 沒 open 局就立即開新局
+                    # 沒 open 局就開新局
                     cur.execute("SELECT 1 FROM rounds WHERE status='open' AND outcome IS NULL LIMIT 1")
                     has_open = cur.fetchone() is not None
                     if not has_open:
@@ -593,7 +594,7 @@ async def auto_dealer_loop():
                         )
                     release_lock(cur)
 
-            # 正常流程：等待截止→關單→結算→等待動畫→緩衝
+            # 正常節奏：等待截止 → 關單 → 結算 → 等待動畫/緩衝
             with psycopg.connect(url, autocommit=True) as conn:
                 with conn.cursor() as cur:
                     cur.execute("""
@@ -648,7 +649,7 @@ async def auto_dealer_loop():
                         for uid, add in pay_map.items():
                             cur.execute("UPDATE users SET balance = COALESCE(balance,0) + %s WHERE id=%s", (add, uid))
 
-                        # 等待前端動畫
+                        # 等前端動畫結束＋緩衝
                         await asyncio.sleep(AUTO_REVEAL_SEC)
                         await asyncio.sleep(AUTO_GAP_SEC)
 
@@ -657,11 +658,10 @@ async def auto_dealer_loop():
             print("[auto_dealer_loop] error:", e)
             await asyncio.sleep(3)
 
-# ======== Startup ========
+# ================= Startup =================
 @app.on_event("startup")
 def on_startup():
     init_db()
-    ensure_schema_ext()
     if AUTO_DEAL:
         asyncio.create_task(auto_dealer_loop())
         print(f"[auto] enabled: bet={AUTO_BET_SEC}s reveal={AUTO_REVEAL_SEC}s gap={AUTO_GAP_SEC}s")
