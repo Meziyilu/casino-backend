@@ -203,3 +203,46 @@ def login(body: LoginIn):
 @app.get("/me")
 def me(user=Depends(get_current_user)):
     return {"id": user["user_id"], "username": user["username"]}
+
+# ==== Balance APIs ====
+from typing import Optional
+from fastapi import Body
+
+@app.get("/balance")
+def get_balance(user=Depends(get_current_user)):
+    url = os.getenv("DATABASE_URL")
+    with psycopg.connect(url) as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT balance FROM users WHERE id=%s", (user["user_id"],))
+            row = cur.fetchone()
+            if not row:
+                raise HTTPException(404, "User not found")
+            return {"balance": int(row[0] or 0)}
+
+# 簡單的管理者加點數：用環境變數 ADMIN_TOKEN 做保護
+ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "")
+
+class GrantIn(BaseModel):
+    username: str
+    amount: int  # 正數加點、負數扣點
+
+@app.post("/admin/grant")
+def admin_grant(
+    body: GrantIn,
+    x_admin_token: Optional[str] = Header(None, alias="X-Admin-Token"),
+):
+    if not ADMIN_TOKEN or x_admin_token != ADMIN_TOKEN:
+        raise HTTPException(401, "Invalid admin token")
+    if body.amount == 0:
+        raise HTTPException(400, "amount cannot be 0")
+
+    url = os.getenv("DATABASE_URL")
+    with psycopg.connect(url, autocommit=True) as conn:
+        with conn.cursor() as cur:
+            # 直接以 username 對應修改餘額
+            cur.execute("UPDATE users SET balance = COALESCE(balance,0) + %s WHERE username=%s RETURNING balance",
+                        (body.amount, body.username))
+            row = cur.fetchone()
+            if not row:
+                raise HTTPException(404, "User not found")
+            return {"username": body.username, "balance": int(row[0])}
