@@ -1,43 +1,23 @@
+# app.py
 import os
+import hashlib
+from datetime import datetime, timedelta, timezone
+from typing import Optional, List
+
 import psycopg
-from contextlib import contextmanager
-from fastapi import FastAPI, HTTPException, Depends, Header
+from fastapi import FastAPI, Depends, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-from typing import Optional
-import datetime
+from pydantic import BaseModel, Field
+from passlib.hash import bcrypt
 
-APP_NAME = "Casino Auth + Lobby (Reset Clean)"
-DATABASE_URL = os.getenv("DATABASE_URL")
-if not DATABASE_URL:
-    raise RuntimeError("Missing DATABASE_URL")
+APP_NAME = "Casino API"
 
-# ---------- DB ----------
-@contextmanager
-def get_conn():
-    with psycopg.connect(DATABASE_URL, autocommit=False) as conn:
-        yield conn
+# ---------- env ----------
+DATABASE_URL = os.getenv("DATABASE_URL", "")
+ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "changeme")
+TZ = timezone(timedelta(hours=8))  # Asia/Taipei
 
-def init_db():
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute("""
-            CREATE TABLE IF NOT EXISTS users (
-              id SERIAL PRIMARY KEY,
-              username TEXT UNIQUE,
-              password TEXT,
-              nickname TEXT,
-              balance BIGINT DEFAULT 1000,
-              is_admin BOOLEAN DEFAULT FALSE,
-              created_at TIMESTAMPTZ DEFAULT now()
-            );
-            """)
-        conn.commit()
-
-# ---------- APP & CORS ----------
-app = FastAPI(title=APP_NAME)
-
-def get_allowed_origins() -> list[str]:
+def get_allowed_origins() -> List[str]:
     raw = os.getenv("ALLOWED_ORIGINS", "")
     if raw.strip():
         return [o.strip() for o in raw.split(",") if o.strip()]
@@ -47,6 +27,8 @@ def get_allowed_origins() -> list[str]:
         "http://localhost:5173",
     ]
 
+# ---------- app ----------
+app = FastAPI(title=APP_NAME)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=get_allowed_origins(),
@@ -55,112 +37,200 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ---------- Models ----------
-class RegisterReq(BaseModel):
-    username: str
-    password: str
+# ---------- DB ----------
+def db():
+    return psycopg.connect(DATABASE_URL, autocommit=True)
 
-class LoginReq(BaseModel):
-    username: str
-    password: str
+def init_db():
+    with db() as conn, conn.cursor() as cur:
+        # users
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS users(
+          id SERIAL PRIMARY KEY,
+          username TEXT UNIQUE NOT NULL,
+          password_hash TEXT NOT NULL,
+          nickname TEXT,
+          balance BIGINT DEFAULT 0,
+          created_at TIMESTAMPTZ DEFAULT NOW()
+        );
+        """)
+        # index
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_users_created_at ON users(created_at);")
+init_db()
+
+# ---------- models ----------
+class AuthIn(BaseModel):
+    username: str = Field(..., min_length=2, max_length=40)
+    password: str = Field(..., min_length=6, max_length=64)
+    nickname: Optional[str] = None
 
 class UserOut(BaseModel):
     id: int
     username: str
     nickname: Optional[str]
     balance: int
-    is_admin: bool
-    created_at: datetime.datetime
+    created_at: datetime
+
+def row_user_to_out(r) -> UserOut:
+    return UserOut(id=r[0], username=r[1], nickname=r[3], balance=r[4], created_at=r[5])
+
+# ---------- helpers ----------
+def hash_pw(p: str) -> str:
+    return bcrypt.hash(p)
+
+def verify_pw(p: str, h: str) -> bool:
+    try:
+        return bcrypt.verify(p, h)
+    except Exception:
+        return False
 
 # ---------- Auth ----------
 @app.post("/auth/register")
-def register(body: RegisterReq):
-    un = body.username.strip().lower()
-    pw = body.password.strip()
-    if not un or not pw:
-        raise HTTPException(status_code=400, detail="username/password required")
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            try:
-                cur.execute(
-                    "INSERT INTO users (username, password, nickname) VALUES (%s, %s, %s) RETURNING id;",
-                    (un, pw, un),
-                )
-                uid = cur.fetchone()[0]
-                conn.commit()
-                return {"ok": True, "id": uid, "username": un}
-            except psycopg.errors.UniqueViolation:
-                conn.rollback()
-                raise HTTPException(status_code=409, detail="username already exists")
+def register(payload: AuthIn):
+    with db() as conn, conn.cursor() as cur:
+        cur.execute("SELECT 1 FROM users WHERE username=%s", (payload.username,))
+        if cur.fetchone():
+            raise HTTPException(409, "USERNAME_TAKEN")
+        cur.execute(
+            "INSERT INTO users(username,password_hash,nickname,balance) VALUES(%s,%s,%s,0) RETURNING id,username,password_hash,nickname,balance,created_at",
+            (payload.username, hash_pw(payload.password), payload.nickname or payload.username),
+        )
+        r = cur.fetchone()
+        return {"ok": True, "user": row_user_to_out(r).model_dump()}
 
 @app.post("/auth/login")
-def login(body: LoginReq):
-    un = body.username.strip().lower()
-    pw = body.password.strip()
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute("SELECT id, password FROM users WHERE username=%s;", (un,))
-            row = cur.fetchone()
-            if not row or row[1] != pw:
-                raise HTTPException(status_code=401, detail="invalid username or password")
-            uid = row[0]
-    return {"ok": True, "id": uid, "username": un, "token": f"user-{uid}"}
+def login(payload: AuthIn):
+    with db() as conn, conn.cursor() as cur:
+        cur.execute("SELECT id,username,password_hash,nickname,balance,created_at FROM users WHERE username=%s", (payload.username,))
+        r = cur.fetchone()
+        if not r or not verify_pw(payload.password, r[2]):
+            raise HTTPException(401, "INVALID_CREDENTIALS")
+        return {"ok": True, "user": row_user_to_out(r).model_dump()}
 
-@app.get("/me", response_model=UserOut)
-def me(username: str):
-    with get_conn() as conn:
-        with conn.cursor() as cur:
+# ---------- Lobby ----------
+@app.get("/lobby/summary")
+def lobby_summary():
+    now = datetime.now(TZ)
+    start = datetime(now.year, now.month, now.day, tzinfo=TZ)
+    with db() as conn, conn.cursor() as cur:
+        cur.execute("SELECT COUNT(*), COALESCE(SUM(balance),0) FROM users")
+        total_users, total_balance = cur.fetchone()
+        cur.execute("SELECT COUNT(*) FROM users WHERE created_at >= %s", (start.astimezone(timezone.utc),))
+        today_users = cur.fetchone()[0]
+    return {"ok": True, "summary": {
+        "totalUsers": total_users, "todayNewUsers": today_users, "totalBalance": int(total_balance)
+    }}
+
+# =========================================================
+#                     Admin API (token)
+# =========================================================
+def require_admin(x_admin_token: Optional[str] = Header(None, alias="X-Admin-Token")):
+    if not x_admin_token or x_admin_token != ADMIN_TOKEN:
+        raise HTTPException(401, "ADMIN_TOKEN_INVALID")
+    return True
+
+class QueryUsersIn(BaseModel):
+    q: Optional[str] = ""
+    page: int = 1
+    size: int = 20
+
+class GrantIn(BaseModel):
+    amount: int = Field(..., ge=-10_000_000, le=10_000_000)
+
+class SetBalanceIn(BaseModel):
+    balance: int = Field(..., ge=0, le=10_000_000_000)
+
+class ResetPwIn(BaseModel):
+    new_password: str = Field(..., min_length=6, max_length=64)
+
+@app.get("/admin/stats")
+def admin_stats(_: bool = Depends(require_admin)):
+    now = datetime.now(TZ)
+    start = datetime(now.year, now.month, now.day, tzinfo=TZ)
+    with db() as conn, conn.cursor() as cur:
+        cur.execute("SELECT COUNT(*), COALESCE(SUM(balance),0) FROM users")
+        total_users, total_balance = cur.fetchone()
+        cur.execute("SELECT COUNT(*) FROM users WHERE created_at >= %s", (start.astimezone(timezone.utc),))
+        today_users = cur.fetchone()[0]
+    return {"ok": True, "stats": {
+        "totalUsers": total_users, "todayNewUsers": today_users, "totalBalance": int(total_balance)
+    }}
+
+@app.post("/admin/users")
+def admin_users(body: QueryUsersIn, _: bool = Depends(require_admin)):
+    q = (body.q or "").strip()
+    page = max(1, body.page)
+    size = min(100, max(1, body.size))
+    offset = (page - 1) * size
+
+    with db() as conn, conn.cursor() as cur:
+        if q:
+            like = f"%{q}%"
             cur.execute("""
-              SELECT id, username, nickname, balance, is_admin, created_at
-              FROM users WHERE username=%s;
-            """, (username,))
-            row = cur.fetchone()
-            if not row:
-                raise HTTPException(status_code=404, detail="user not found")
-    return UserOut(
-        id=row[0], username=row[1], nickname=row[2],
-        balance=int(row[3]), is_admin=bool(row[4]), created_at=row[5]
-    )
-
-@app.get("/health")
-def health():
-    return {"ok": True, "name": APP_NAME, "allowed": get_allowed_origins()}
-
-# ---------- Admin: 一鍵清庫重建 ----------
-ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "").strip()
-
-def require_admin(authorization: str = Header(default="")):
-    parts = authorization.split(" ", 1)
-    supplied = parts[1] if len(parts) == 2 and parts[0].lower() == "bearer" else ""
-    if not ADMIN_TOKEN or supplied != ADMIN_TOKEN:
-        raise HTTPException(status_code=401, detail="unauthorized")
-
-@app.post("/admin/reset-db")
-def admin_reset_db(_=Depends(require_admin)):
-    """
-    ⚠️ 不可逆：刪除 baccarat 相關表與 users 表，重建乾淨 users 表。
-    """
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            # 刪 baccarat 相關（存在才刪）
-            cur.execute("DROP TABLE IF EXISTS bets CASCADE;")
-            cur.execute("DROP TABLE IF EXISTS rounds CASCADE;")
-            # 刪 users 並重建
-            cur.execute("DROP TABLE IF EXISTS users CASCADE;")
+                SELECT id,username,password_hash,nickname,balance,created_at
+                FROM users
+                WHERE username ILIKE %s OR nickname ILIKE %s
+                ORDER BY created_at DESC
+                LIMIT %s OFFSET %s
+            """, (like, like, size, offset))
+        else:
             cur.execute("""
-            CREATE TABLE IF NOT EXISTS users (
-              id SERIAL PRIMARY KEY,
-              username TEXT UNIQUE,
-              password TEXT,
-              nickname TEXT,
-              balance BIGINT DEFAULT 1000,
-              is_admin BOOLEAN DEFAULT FALSE,
-              created_at TIMESTAMPTZ DEFAULT now()
-            );
-            """)
-        conn.commit()
-    return {"ok": True, "message": "database reset to clean users-only schema"}
+                SELECT id,username,password_hash,nickname,balance,created_at
+                FROM users
+                ORDER BY created_at DESC
+                LIMIT %s OFFSET %s
+            """, (size, offset))
+        rows = cur.fetchall()
+        users = [row_user_to_out(r).model_dump() for r in rows]
 
-@app.on_event("startup")
-def on_startup():
-    init_db()
+        # total
+        if q:
+            cur.execute("SELECT COUNT(*) FROM users WHERE username ILIKE %s OR nickname ILIKE %s", (like, like))
+        else:
+            cur.execute("SELECT COUNT(*) FROM users")
+        total = cur.fetchone()[0]
+
+    return {"ok": True, "total": total, "page": page, "size": size, "items": users}
+
+@app.post("/admin/users/{uid}/grant")
+def admin_grant(uid: int, body: GrantIn, _: bool = Depends(require_admin)):
+    with db() as conn, conn.cursor() as cur:
+        cur.execute("UPDATE users SET balance = balance + %s WHERE id=%s RETURNING id,username,password_hash,nickname,balance,created_at",
+                    (body.amount, uid))
+        r = cur.fetchone()
+        if not r:
+            raise HTTPException(404, "USER_NOT_FOUND")
+    return {"ok": True, "user": row_user_to_out(r).model_dump()}
+
+@app.post("/admin/users/{uid}/set-balance")
+def admin_set_balance(uid: int, body: SetBalanceIn, _: bool = Depends(require_admin)):
+    with db() as conn, conn.cursor() as cur:
+        cur.execute("UPDATE users SET balance=%s WHERE id=%s RETURNING id,username,password_hash,nickname,balance,created_at",
+                    (body.balance, uid))
+        r = cur.fetchone()
+        if not r:
+            raise HTTPException(404, "USER_NOT_FOUND")
+    return {"ok": True, "user": row_user_to_out(r).model_dump()}
+
+@app.post("/admin/users/{uid}/reset-password")
+def admin_reset_password(uid: int, body: ResetPwIn, _: bool = Depends(require_admin)):
+    with db() as conn, conn.cursor() as cur:
+        cur.execute("UPDATE users SET password_hash=%s WHERE id=%s RETURNING id,username,password_hash,nickname,balance,created_at",
+                    (hash_pw(body.new_password), uid))
+        r = cur.fetchone()
+        if not r:
+            raise HTTPException(404, "USER_NOT_FOUND")
+    return {"ok": True}
+
+@app.delete("/admin/users/{uid}")
+def admin_delete_user(uid: int, _: bool = Depends(require_admin)):
+    with db() as conn, conn.cursor() as cur:
+        cur.execute("DELETE FROM users WHERE id=%s RETURNING 1", (uid,))
+        if not cur.fetchone():
+            raise HTTPException(404, "USER_NOT_FOUND")
+    return {"ok": True}
+
+# health
+@app.get("/")
+def root():
+    return {"ok": True, "service": APP_NAME}
