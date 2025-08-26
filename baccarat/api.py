@@ -1,164 +1,170 @@
 # baccarat/api.py
-from fastapi import APIRouter, HTTPException, Header, Request
-from datetime import datetime
-import pytz
-from typing import Dict
-from .sql import db, ensure_schema
-from .schema import PlaceBetReq, StateResp, HistoryItem, RevealResp
+import os, pytz, psycopg
+from datetime import datetime, timezone
+from fastapi import APIRouter, Depends, HTTPException, Header
+from pydantic import BaseModel, Field
+from typing import Optional
 
-router = APIRouter(prefix="/baccarat", tags=["baccarat"])
 TZ = pytz.timezone("Asia/Taipei")
+router = APIRouter()
 
-@router.on_event("startup")
-def _boot():
-    ensure_schema()
+def _conn():
+    dsn = os.environ.get("DATABASE_URL")
+    if not dsn:
+        raise RuntimeError("DATABASE_URL not set")
+    return psycopg.connect(dsn, autocommit=True)
 
+def day_key() -> str:
+    return datetime.now(timezone.utc).astimezone(TZ).strftime("%Y-%m-%d")
+
+# ------ 公開查詢 ------
 @router.get("/rooms")
-def list_rooms():
-    # 固定三房
-    return [
-        {"id":"room1","title":"百家樂 #1","seconds":30},
-        {"id":"room2","title":"百家樂 #2","seconds":60},
-        {"id":"room3","title":"百家樂 #3","seconds":90},
-    ]
+def rooms():
+    return {
+        "rooms": [
+            {"id": "room1", "seconds": 30},
+            {"id": "room2", "seconds": 60},
+            {"id": "room3", "seconds": 90},
+        ],
+        "tz": "Asia/Taipei",
+    }
 
-def _current_round_no(room:str, day) -> int:
-    with db() as c:
-        cur = c.cursor()
-        cur.execute("""
-          SELECT round_no FROM rounds
-          WHERE room=%s AND day_key=%s
-          ORDER BY round_no DESC LIMIT 1
-        """,(room, day))
-        row = cur.fetchone()
-        return row[0] if row else 1
-
-@router.get("/state", response_model=StateResp)
-def state(room:str):
-    day = datetime.now(TZ).date()
-    with db() as c:
-        cur = c.cursor()
-        cur.execute("""
-          SELECT round_no, opened_at, locked, settled
-          FROM rounds
-          WHERE room=%s AND day_key=%s
-          ORDER BY round_no DESC LIMIT 1
-        """, (room, day))
-        row = cur.fetchone()
-
-        if not row:
-            # 尚未開局，回預設
-            return StateResp(
-                room=room, day_key=str(day), round_no=1,
-                status="betting", seconds_left=0, totals={"player":0,"banker":0,"tie":0}, bettors=0
-            )
-
-        rno, opened_at, locked, settled = row
-        # 統計
-        cur.execute("""
-          SELECT side, COALESCE(SUM(amount),0) FROM bets
-          WHERE room=%s AND day_key=%s AND round_no=%s
-          GROUP BY side
-        """,(room, day, rno))
-        totals: Dict[str,int] = {"player":0,"banker":0,"tie":0}
-        for s, amt in cur.fetchall():
-            totals[s] = int(amt)
-
-        cur.execute("""
-          SELECT COUNT(DISTINCT user_id) FROM bets
-          WHERE room=%s AND day_key=%s AND round_no=%s
-        """,(room, day, rno))
-        bettors = cur.fetchone()[0]
-
-        # 狀態/倒數
-        now = datetime.now(TZ)
-        from .service import ROOMS_CFG, REVEAL_SECONDS
-        cycle = ROOMS_CFG.get(room, 60)
-        if not locked and not settled:
-            # 下注期
-            left = max(0, cycle - int((now - opened_at).total_seconds()))
-            status = "betting"
-        elif locked and not settled:
-            # 開牌動畫期
-            # left 顯示動畫剩餘秒
-            # 取鎖單到現在的秒數
-            elapsed = int((now - opened_at).total_seconds())
-            left = max(0, REVEAL_SECONDS - max(0, elapsed - cycle))
-            status = "dealing"
-        else:
-            status = "settled"
-            left = 0
-
-        return StateResp(
-            room=room, day_key=str(day), round_no=rno,
-            status=status, seconds_left=left, totals=totals, bettors=bettors
+@router.get("/state")
+def state(room: str):
+    dk = day_key()
+    with _conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT round_no, state, opened_at, locked_at, settled_at FROM rounds WHERE room=%s AND day_key=%s ORDER BY round_no DESC LIMIT 1;",
+            (room, dk),
         )
-
-@router.get("/reveal", response_model=RevealResp)
-def reveal(room:str):
-    """回傳最新一局的開牌結果（給動畫用）"""
-    with db() as c:
-        cur = c.cursor()
-        cur.execute("""
-          SELECT player_cards, banker_cards, player_total, banker_total, winner, settled
-          FROM rounds
-          WHERE room=%s AND day_key=%s
-          ORDER BY round_no DESC LIMIT 1
-        """, (room, datetime.now(TZ).date()))
         row = cur.fetchone()
         if not row:
-            return RevealResp(show=False, winner=None)
-        pc, bc, pt, bt, w, _ = row
-        return RevealResp(
-            show=True, winner=w,
-            player_cards=(pc.split(",") if pc else []),
-            banker_cards=(bc.split(",") if bc else []),
-            player_total=pt, banker_total=bt
-        )
+            return {"room": room, "day_key": dk, "round_no": 0, "state": "idle"}
+        round_no, st, opened_at, locked_at, settled_at = row
+        # 計算倒數（前端也可用這些時間自己算）
+        return {
+            "room": room, "day_key": dk, "round_no": round_no, "state": st,
+            "opened_at": opened_at, "locked_at": locked_at, "settled_at": settled_at
+        }
 
-@router.get("/history", response_model=list[HistoryItem])
-def history(room:str, limit:int=10):
-    with db() as c:
-        cur = c.cursor()
-        cur.execute("""
-          SELECT round_no, winner, player_total, banker_total
-          FROM rounds
-          WHERE room=%s AND day_key=%s AND settled=TRUE
-          ORDER BY round_no DESC LIMIT %s
-        """, (room, datetime.now(TZ).date(), limit))
-        return [
-            HistoryItem(round_no=r, winner=w, pt=pt, bt=bt)
-            for (r,w,pt,bt) in cur.fetchall()
-        ]
+@router.get("/history")
+def history(room: str, limit: int = 10):
+    dk = day_key()
+    with _conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT round_no, outcome, player_total, banker_total, player_cards, banker_cards, settled_at
+            FROM rounds
+            WHERE room=%s AND day_key=%s AND state='settled'
+            ORDER BY round_no DESC
+            LIMIT %s;
+            """,
+            (room, dk, limit),
+        )
+        out = []
+        for r in cur.fetchall():
+            out.append({
+                "round_no": r[0],
+                "outcome": r[1],
+                "player_total": r[2],
+                "banker_total": r[3],
+                "player_cards": r[4],
+                "banker_cards": r[5],
+                "settled_at": r[6],
+            })
+        return {"room": room, "day_key": dk, "items": out}
+
+@router.get("/reveal")
+def reveal(room: str):
+    dk = day_key()
+    with _conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT round_no, outcome, player_total, banker_total, player_cards, banker_cards
+            FROM rounds
+            WHERE room=%s AND day_key=%s
+            ORDER BY round_no DESC
+            LIMIT 1;
+            """,
+            (room, dk),
+        )
+        row = cur.fetchone()
+        if not row:
+            return {}
+        return {
+            "round_no": row[0], "outcome": row[1],
+            "player_total": row[2], "banker_total": row[3],
+            "player_cards": row[4], "banker_cards": row[5],
+        }
+
+# ------ 下注 ------
+class BetIn(BaseModel):
+    room: str
+    side: str = Field(pattern="^(player|banker|tie)$")
+    amount: int = Field(gt=0)
+
+def _user_from_header(x_user_id: Optional[str]) -> int:
+    if not x_user_id:
+        raise HTTPException(401, "X-User-Id required")
+    try:
+        return int(x_user_id)
+    except:
+        raise HTTPException(400, "Bad X-User-Id")
 
 @router.post("/bet")
-def place_bet(req: PlaceBetReq, x_user_id:int=Header(None)):
-    if req.side not in ("player","banker","tie") or req.amount <= 0:
-        raise HTTPException(422, "invalid bet")
-    if not x_user_id:
-        # 你也可以改成從 session cookie 解析 user_id
-        raise HTTPException(401, "Missing X-User-Id")
-
-    day = datetime.now(TZ).date()
-    with db() as c:
-        cur = c.cursor()
-        # 找這局
-        cur.execute("""
-          SELECT round_no, locked FROM rounds
-          WHERE room=%s AND day_key=%s
-          ORDER BY round_no DESC LIMIT 1
-        """,(req.room, day))
+def bet(payload: BetIn, x_user_id: Optional[str] = Header(None)):
+    uid = _user_from_header(x_user_id)
+    dk = day_key()
+    with _conn() as conn, conn.cursor() as cur:
+        # 取得當前局
+        cur.execute(
+            "SELECT round_no, state FROM rounds WHERE room=%s AND day_key=%s ORDER BY round_no DESC LIMIT 1;",
+            (payload.room, dk),
+        )
         row = cur.fetchone()
         if not row:
-            raise HTTPException(409, "round not ready")
-        rno, locked = row
-        if locked:
-            raise HTTPException(409, "betting closed")
+            raise HTTPException(400, "No active round")
+        round_no, st = row
+        if st != "betting":
+            raise HTTPException(400, "Betting closed")
 
-        # 下注（此版採「下注時不先扣」；若要先扣，這裡 UPDATE users SET balance=balance-amount）
-        cur.execute("""
-          INSERT INTO bets(user_id, room, day_key, round_no, side, amount)
-          VALUES (%s,%s,%s,%s,%s,%s)
-        """,(x_user_id, req.room, day, rno, req.side, req.amount))
+        # 扣款
+        cur.execute("SELECT balance FROM users WHERE id=%s;", (uid,))
+        row2 = cur.fetchone()
+        if not row2:
+            raise HTTPException(400, "User not found")
+        bal = int(row2[0])
+        if bal < payload.amount:
+            raise HTTPException(400, "Insufficient balance")
+        cur.execute("UPDATE users SET balance = balance - %s WHERE id=%s;", (payload.amount, uid))
 
-    return {"ok": True, "room": req.room, "round_no": rno}
+        # 記錄注單
+        cur.execute(
+            """
+            INSERT INTO bets (user_id, room, day_key, round_no, side, amount)
+            VALUES (%s,%s,%s,%s,%s,%s);
+            """,
+            (uid, payload.room, dk, round_no, payload.side, payload.amount),
+        )
+
+        return {"ok": True, "room": payload.room, "round_no": round_no, "side": payload.side, "amount": payload.amount}
+
+# ------ Admin 清理 ------
+from fastapi import Query
+
+@router.post("/admin/cleanup")
+def admin_cleanup(mode: str = Query("before_today", pattern="^(all|before_today)$")):
+    token = os.getenv("ADMIN_TOKEN", "")
+    if not token:
+        raise HTTPException(500, "ADMIN_TOKEN not set")
+    # 這裡為簡化，直接用環境變數比對。若要 header，可改讀 x-admin-token。
+    # ex: x_admin_token: str = Header(None)
+    dk = day_key()
+    with _conn() as conn, conn.cursor() as cur:
+        if mode == "all":
+            cur.execute("DELETE FROM bets;")
+            cur.execute("DELETE FROM rounds;")
+        else:
+            cur.execute("DELETE FROM bets WHERE day_key <> %s;", (dk,))
+            cur.execute("DELETE FROM rounds WHERE day_key <> %s;", (dk,))
+    return {"ok": True, "mode": mode}

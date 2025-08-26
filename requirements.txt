@@ -2,4 +2,6 @@ fastapi==0.115.0
 uvicorn[standard]==0.30.0
 python-dotenv==1.0.1
 psycopg[binary]==3.2.9
-pytz==2025.1
+pytz==2024.2
+bcrypt==4.2.0
+PyJWT==2.9.0

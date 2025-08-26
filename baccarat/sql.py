@@ -2,58 +2,56 @@
 import os
 import psycopg
 
-DATABASE_URL = os.getenv("DATABASE_URL")
+DDL = """
+CREATE TABLE IF NOT EXISTS users (
+  id SERIAL PRIMARY KEY,
+  username TEXT UNIQUE NOT NULL,
+  password_hash TEXT NOT NULL,
+  nickname TEXT,
+  balance BIGINT DEFAULT 0,
+  is_admin BOOLEAN DEFAULT FALSE,
+  created_at TIMESTAMPTZ DEFAULT now()
+);
 
-def db():
-    return psycopg.connect(DATABASE_URL, autocommit=True)
+CREATE TABLE IF NOT EXISTS rounds (
+  id BIGSERIAL PRIMARY KEY,
+  room TEXT NOT NULL,
+  day_key TEXT NOT NULL,      -- 'YYYY-MM-DD' (台北日)
+  round_no INT NOT NULL,
+  state TEXT NOT NULL DEFAULT 'betting', -- betting | locked | settled
+  opened_at TIMESTAMPTZ DEFAULT now(),
+  locked_at TIMESTAMPTZ,
+  settled_at TIMESTAMPTZ,
+  player_cards JSONB,         -- ["8H","3C","..."]
+  banker_cards JSONB,
+  player_total INT,
+  banker_total INT,
+  outcome TEXT                -- 'player' | 'banker' | 'tie'
+);
+
+-- 每日每房局號唯一
+CREATE UNIQUE INDEX IF NOT EXISTS idx_rounds_unique ON rounds(room, day_key, round_no);
+CREATE INDEX IF NOT EXISTS idx_rounds_lookup ON rounds(room, day_key, state);
+
+CREATE TABLE IF NOT EXISTS bets (
+  id BIGSERIAL PRIMARY KEY,
+  user_id INT NOT NULL REFERENCES users(id),
+  room TEXT NOT NULL,
+  day_key TEXT NOT NULL,
+  round_no INT NOT NULL,
+  side TEXT NOT NULL,         -- 'player' | 'banker' | 'tie'
+  amount BIGINT NOT NULL,
+  created_at TIMESTAMPTZ DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_bets_lookup ON bets(room, day_key, round_no);
+"""
+
+def _conn():
+    dsn = os.environ.get("DATABASE_URL")
+    if not dsn:
+        raise RuntimeError("DATABASE_URL not set")
+    return psycopg.connect(dsn, autocommit=True)
 
 def ensure_schema():
-    with db() as c:
-        cur = c.cursor()
-
-        # 使用者（保守版，存在就不動）
-        cur.execute("""
-        CREATE TABLE IF NOT EXISTS users(
-          id SERIAL PRIMARY KEY,
-          username TEXT UNIQUE,
-          password_hash TEXT,
-          nickname TEXT,
-          balance BIGINT DEFAULT 0,
-          created_at TIMESTAMPTZ DEFAULT now()
-        );
-        """)
-
-        # 局表：room + day_key + round_no 唯一；locked/settled 控制投注/結算階段
-        cur.execute("""
-        CREATE TABLE IF NOT EXISTS rounds(
-          id BIGSERIAL PRIMARY KEY,
-          room TEXT NOT NULL,
-          day_key DATE NOT NULL,
-          round_no INT NOT NULL,
-          opened_at TIMESTAMPTZ DEFAULT now(),
-          locked BOOLEAN DEFAULT FALSE,
-          settled BOOLEAN DEFAULT FALSE,
-          player_cards TEXT,     -- "A,9,6"
-          banker_cards TEXT,     -- "K,2"
-          player_total INT,
-          banker_total INT,
-          winner TEXT,           -- 'player'|'banker'|'tie'
-          UNIQUE(room, day_key, round_no)
-        );
-        """)
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_rounds_room_day ON rounds(room, day_key);")
-
-        # 下注表
-        cur.execute("""
-        CREATE TABLE IF NOT EXISTS bets(
-          id BIGSERIAL PRIMARY KEY,
-          user_id INT NOT NULL,
-          room TEXT NOT NULL,
-          day_key DATE NOT NULL,
-          round_no INT NOT NULL,
-          side TEXT NOT NULL,        -- 'player'|'banker'|'tie'
-          amount BIGINT NOT NULL,
-          created_at TIMESTAMPTZ DEFAULT now()
-        );
-        """)
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_bets_room_day_round ON bets(room, day_key, round_no);")
+    with _conn() as conn, conn.cursor() as cur:
+        cur.execute(DDL)
