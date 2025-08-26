@@ -1,68 +1,18 @@
+# app.py
 import os
-import psycopg
-from fastapi import FastAPI, Depends, HTTPException, Request
+import asyncio
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-from datetime import datetime
-import pytz
 
-APP_NAME = "TOPZ Casino Backend"
-DB_URL = os.getenv("DATABASE_URL")
-ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "changeme")
+# ---- 先建立 app（很重要，要在 include_router 之前）----
+app = FastAPI(title="TOPZ Casino Backend")
 
-# ---------- DB ----------
-def get_conn():
-    return psycopg.connect(DB_URL, autocommit=True)
-
-def init_db():
-    with get_conn() as conn:
-        cur = conn.cursor()
-        cur.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            id SERIAL PRIMARY KEY,
-            username TEXT UNIQUE,
-            password TEXT NOT NULL,
-            nickname TEXT,
-            balance BIGINT DEFAULT 0,
-            created_at TIMESTAMPTZ DEFAULT now()
-        );
-        """)
-    print("✅ DB 初始化完成")
-
-# 掛上百家樂
-app.include_router(baccarat_router)
-
-@app.on_event("startup")
-async def _boot():
-    ensure_schema()
-    asyncio.create_task(launch_all_rooms())
-    
-# ---------- 時區 ----------
-TZ = pytz.timezone("Asia/Taipei")
-def now_taipei():
-    return datetime.now(TZ)
-
-# ---------- Schemas ----------
-class RegisterReq(BaseModel):
-    username: str
-    password: str
-    nickname: str | None = None
-
-class LoginReq(BaseModel):
-    username: str
-    password: str
-
-class AdminGiveReq(BaseModel):
-    username: str
-    amount: int
-
-# ---------- FastAPI ----------
-app = FastAPI(title=APP_NAME)
-
+# ---- CORS ----
 def get_allowed_origins() -> list[str]:
     raw = os.getenv("ALLOWED_ORIGINS", "")
     if raw.strip():
         return [o.strip() for o in raw.split(",") if o.strip()]
+    # 預設允許你的網域與本機
     return [
         "https://topz0705.com",
         "https://casino-frontend-pya7.onrender.com",
@@ -77,68 +27,25 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ---------- Auth ----------
-@app.post("/auth/register")
-def register(data: RegisterReq):
-    with get_conn() as conn:
-        cur = conn.cursor()
-        try:
-            cur.execute(
-                "INSERT INTO users (username, password, nickname) VALUES (%s,%s,%s) RETURNING id, username, nickname, balance",
-                (data.username, data.password, data.nickname)
-            )
-            row = cur.fetchone()
-            return {"user": {"id": row[0], "username": row[1], "nickname": row[2], "balance": row[3]}}
-        except Exception as e:
-            raise HTTPException(400, f"註冊失敗: {e}")
+# ---- (之後) 再 import 百家樂模組並掛上 router ----
+# 這些 import 要放在 app 建立之後，避免循環 import 或尚未定義 app
+from baccarat.api import router as baccarat_router
+from baccarat.sql import ensure_schema
+from baccarat.service import launch_all_rooms
 
-@app.post("/auth/login")
-def login(data: LoginReq):
-    with get_conn() as conn:
-        cur = conn.cursor()
-        cur.execute("SELECT id, username, password, nickname, balance FROM users WHERE username=%s", (data.username,))
-        row = cur.fetchone()
-        if not row or row[2] != data.password:
-            raise HTTPException(401, "帳號或密碼錯誤")
-        return {"user": {"id": row[0], "username": row[1], "nickname": row[3], "balance": row[4]}}
+app.include_router(baccarat_router)
 
-# ---------- 大廳 ----------
-@app.get("/lobby/summary")
-def lobby_summary():
-    with get_conn() as conn:
-        cur = conn.cursor()
-        cur.execute("SELECT COUNT(*), COALESCE(SUM(balance),0) FROM users")
-        total_users, total_balance = cur.fetchone()
-        # 今日新增
-        cur.execute("SELECT COUNT(*) FROM users WHERE created_at::date = now()::date")
-        today_new, = cur.fetchone()
-        return {"summary": {
-            "totalUsers": total_users,
-            "totalBalance": int(total_balance),
-            "todayNewUsers": today_new
-        }}
-
-# ---------- 管理 ----------
-@app.post("/admin/give")
-def admin_give(req: Request, data: AdminGiveReq):
-    token = req.headers.get("Authorization","").replace("Bearer ","")
-    if token != ADMIN_TOKEN:
-        raise HTTPException(403, "Forbidden")
-
-    with get_conn() as conn:
-        cur = conn.cursor()
-        cur.execute("UPDATE users SET balance = balance + %s WHERE username=%s RETURNING id", (data.amount, data.username))
-        row = cur.fetchone()
-        if not row:
-            raise HTTPException(404, "找不到使用者")
-        return {"ok": True, "username": data.username, "amount": data.amount}
-
-# ---------- 啟動 ----------
-@app.on_event("startup")
-def on_startup():
-    init_db()
-    print("🎲 Casino backend ready:", now_taipei())
+# ---- 你原本的認證 / 大廳等 API（如果有獨立 router 也可以 app.include_router(...) 掛上）----
+# 例如：
+# from auth.api import router as auth_router
+# app.include_router(auth_router)
 
 @app.get("/")
 def root():
-    return {"msg": "Casino backend OK", "time": str(now_taipei())}
+    return {"ok": True, "service": "TOPZ backend"}
+
+# 啟動時做 DB 檢查、啟動三房自動開局背景任務
+@app.on_event("startup")
+async def _boot():
+    ensure_schema()
+    asyncio.create_task(launch_all_rooms())
