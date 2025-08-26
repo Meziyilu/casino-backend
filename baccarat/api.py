@@ -3,11 +3,13 @@ from __future__ import annotations
 
 import os
 from typing import Any, Dict, List, Optional
+from datetime import datetime, timezone, timedelta
 
 import jwt
 import psycopg
-from datetime import datetime, timezone, timedelta
-from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
+import pytz
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, status
+from pydantic import BaseModel, Field
 
 router = APIRouter()
 
@@ -42,6 +44,11 @@ def decode_token_get_uid(authorization: Optional[str] = Header(None)) -> int:
     except Exception:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid token")
     return uid
+
+# ====== 健康檢查（同時用來驗 CORS 是否有套到這組 router） ======
+@router.get("/healthz")
+def healthz():
+    return {"ok": True, "rooms": ROOMS}
 
 # ====== LOBBY ROOMS 列表 ======
 
@@ -166,8 +173,6 @@ def get_state(room: str = Query(..., description="room1|room2|room3")) -> Dict[s
 
 # ====== BET 下單 ======
 
-from pydantic import BaseModel, Field
-
 class BetBody(BaseModel):
     room: str = Field(..., examples=["room1"])
     side: str = Field(..., pattern="^(player|banker|tie)$")
@@ -253,18 +258,14 @@ def history(
 def leaderboard_today() -> Dict[str, Any]:
     """
     以「今日已結算的淨利」排行 (台北時間 00:00 起算)
-    * 這裡假設你有在結算時把每注的贏輸寫回 bets 的某欄位 (例如 settle_amount)，
-      若尚未實作派彩欄位，可以先回傳今日下注總額排行榜或留空實作。
+    * 若尚未實作派彩欄位，可暫時用 SUM(amount) 示意。
     """
-    # 先求台北今日 00:00 的 UTC 時間
-    import pytz
     tz = pytz.timezone("Asia/Taipei")
     today_tpe = datetime.now(tz).replace(hour=0, minute=0, second=0, microsecond=0)
     start_utc = today_tpe.astimezone(timezone.utc)
 
     with get_conn() as conn, conn.cursor() as cur:
-        # 若你還沒 settle 欄位，可改成 SUM(amount) 當示意
-        # 這裡示範以下注總額排行：
+        # 這裡先用下注總額排行示意
         cur.execute(
             """
             SELECT b.user_id, COALESCE(SUM(b.amount),0) AS total
@@ -278,7 +279,6 @@ def leaderboard_today() -> Dict[str, Any]:
         )
         tops = cur.fetchall() or []
 
-        # 取使用者暱稱
         out = []
         for uid, total in tops:
             cur.execute("SELECT nickname FROM users WHERE id=%s;", (uid,))
@@ -340,7 +340,6 @@ def admin_cleanup(body: CleanupBody, _: None = Depends(require_admin)) -> Dict[s
             deleted["rounds"] = cur.rowcount or 0
         else:
             # 計算台北今日 00:00 的 UTC
-            import pytz
             tz = pytz.timezone("Asia/Taipei")
             today_tpe = datetime.now(tz).replace(hour=0, minute=0, second=0, microsecond=0)
             start_utc = today_tpe.astimezone(timezone.utc)
