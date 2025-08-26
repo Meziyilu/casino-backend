@@ -29,6 +29,14 @@ def init_db():
         """)
     print("✅ DB 初始化完成")
 
+# 掛上百家樂
+app.include_router(baccarat_router)
+
+@app.on_event("startup")
+async def _boot():
+    ensure_schema()
+    asyncio.create_task(launch_all_rooms())
+    
 # ---------- 時區 ----------
 TZ = pytz.timezone("Asia/Taipei")
 def now_taipei():
