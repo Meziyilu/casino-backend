@@ -2,15 +2,14 @@ services:
   - type: web
     name: casino-backend
     env: python
-    plan: starter
     buildCommand: pip install -r requirements.txt
-    startCommand: python3 -m uvicorn app:app --host 0.0.0.0 --port $PORT
+    startCommand: python -m uvicorn app:app --host 0.0.0.0 --port $PORT
     envVars:
       - key: DATABASE_URL
-        sync: false
+        sync: false   # 在 Render 介面填入 Postgres External Database URL
       - key: SECRET_KEY
-        sync: false
+        sync: false   # 自訂一組長字串
       - key: ADMIN_TOKEN
-        sync: false
+        sync: false   # 管理 API 用的 token
       - key: ALLOWED_ORIGINS
-        value: "https://topz0705.com,https://casino-frontend-pya7.onrender.com,http://localhost:5173"
+        value: https://topz0705.com,https://casino-frontend-pya7.onrender.com,http://localhost:5173

@@ -1,152 +1,218 @@
 # baccarat/service.py
-import os, asyncio, pytz, psycopg
-from datetime import datetime, timezone
+import asyncio, os, random
+from datetime import timedelta
+from util.db import db
+from .sql import today_key, taipei_now, ensure_schema, BETTING_SECONDS, ROOMS, current_round_info, next_round_no, room_pools
 
-from .logic import deal_round
+ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "admin-dev")
 
-TZ = pytz.timezone("Asia/Taipei")
-
-ROOMS = {
-    "room1": 30,   # 30 秒
-    "room2": 60,   # 60 秒
-    "room3": 90,   # 90 秒
+# 簡單的房態快取（倒數截止時間、當前 round_no、phase）
+_room_state: dict[str, dict] = {
+    # room: { "round_no": int, "phase": "betting|reveal|settled", "deadline": datetime }
 }
 
-def _conn():
-    dsn = os.environ.get("DATABASE_URL")
-    if not dsn:
-        raise RuntimeError("DATABASE_URL not set")
-    return psycopg.connect(dsn, autocommit=True)
+def get_state_snapshot(room: str):
+    s = _room_state.get(room, {})
+    now = taipei_now()
+    seconds_left = None
+    if s.get("deadline"):
+        seconds_left = max(0, int((s["deadline"] - now).total_seconds()))
+    return {
+        "room": room,
+        "round_no": s.get("round_no"),
+        "phase": s.get("phase"),
+        "seconds_left": seconds_left,
+    }
 
-def today_key() -> str:
-    return datetime.now(timezone.utc).astimezone(TZ).strftime("%Y-%m-%d")
+# --- 百家樂點數與補牌規則（10/J/Q/K 都算 0，A=1，2~9 其面值；總點數取 %10） ---
+def draw_card():
+    # 牌面 1..13 -> 牌點 1..9 or 0
+    v = random.randint(1, 13)
+    return 1 if v == 1 else (0 if v >= 10 else v)
 
-def _midnight_changed(last_day: str | None) -> bool:
-    return (last_day is not None) and (last_day != today_key())
+def total(cards):
+    return sum(cards) % 10
 
-def get_last_round_no(conn: psycopg.Connection, room: str, day_key: str) -> int:
-    with conn.cursor() as cur:
-        cur.execute(
-            "SELECT round_no FROM rounds WHERE room = %s AND day_key = %s ORDER BY round_no DESC LIMIT 1;",
-            (room, day_key),
-        )
-        row = cur.fetchone()
-        return int(row[0]) if row else 0
+def compute_baccarat_result():
+    # 依賭場標準第三張牌規則（簡化：等同常見表）
+    p = [draw_card(), draw_card()]
+    b = [draw_card(), draw_card()]
+    pt = total(p)
+    bt = total(b)
 
-def open_round(conn, room, day_key, round_no):
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            INSERT INTO rounds (room, day_key, round_no, state, opened_at)
-            VALUES (%s, %s, %s, 'betting', NOW())
-            ON CONFLICT (room, day_key, round_no) DO NOTHING;
-            """,
-            (room, day_key, round_no),
-        )
+    # natural
+    if pt in (8, 9) or bt in (8, 9):
+        return p, b, pt, bt, False, False
 
-def lock_round(conn, room, day_key, round_no):
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            UPDATE rounds
-            SET state='locked', locked_at=NOW()
-            WHERE room=%s AND day_key=%s AND round_no=%s;
-            """,
-            (room, day_key, round_no),
-        )
+    # 閒先補
+    p3_flag = False
+    if pt <= 5:
+        p.append(draw_card())
+        p3_flag = True
+        pt = total(p)
 
-def settle_round(conn, room, day_key, round_no):
-    # 發牌並結算
-    deal = deal_round()
-    outcome = deal["outcome"]
-    pt = deal["player_total"]
-    bt = deal["banker_total"]
+    # 莊補牌規則
+    b3_flag = False
+    if not p3_flag:
+        if bt <= 5:
+            b.append(draw_card())
+            b3_flag = True
+            bt = total(b)
+    else:
+        third = p[2]
+        # 根據表格（常見規則）
+        draw = False
+        if bt <= 2:
+            draw = True
+        elif bt == 3 and third != 8:
+            draw = True
+        elif bt == 4 and (2 <= third <= 7):
+            draw = True
+        elif bt == 5 and (4 <= third <= 7):
+            draw = True
+        elif bt == 6 and (6 <= third <= 7):
+            draw = True
+        if draw:
+            b.append(draw_card())
+            b3_flag = True
+            bt = total(b)
 
-    with conn.cursor() as cur:
-        # 更新局結果
-        cur.execute(
-            """
-            UPDATE rounds
-            SET state='settled',
-                settled_at=NOW(),
-                player_cards=%s,
-                banker_cards=%s,
-                player_total=%s,
-                banker_total=%s,
-                outcome=%s
-            WHERE room=%s AND day_key=%s AND round_no=%s;
-            """,
-            (
-                deal["player_cards"],
-                deal["banker_cards"],
-                pt, bt, outcome,
-                room, day_key, round_no
-            ),
-        )
+    return p, b, pt, bt, p3_flag, b3_flag
 
-        # 派彩：莊0.95、閒1、和8；遇和局時莊/閒退回
-        cur.execute(
-            "SELECT user_id, side, amount FROM bets WHERE room=%s AND day_key=%s AND round_no=%s;",
-            (room, day_key, round_no),
-        )
-        for user_id, side, amount in cur.fetchall():
-            payout = 0
-            refund = 0
-            if outcome == "tie":
-                if side in ("player","banker"):
-                    refund = amount  # 退回
-                elif side == "tie":
-                    payout = amount * 8
-            else:
-                if side == outcome:
-                    if side == "player":
-                        payout = amount * 1
-                    elif side == "banker":
-                        payout = int(amount * 0.95)
-                    # side == tie 不會在這裡
-            delta = payout + refund
-            if delta:
-                cur.execute("UPDATE users SET balance = balance + %s WHERE id=%s;", (delta, user_id))
+async def single_room_loop(room: str):
+    # 使用 advisory lock 確保單實例
+    lock_key = 0xBACC00 + hash(room) % 10000
+    while True:
+        try:
+            ensure_schema()
+            with db() as conn, conn.cursor() as cur:
+                cur.execute("SELECT pg_try_advisory_lock(%s);", (lock_key,))
+                got = cur.fetchone()["pg_try_advisory_lock"]
+                if not got:
+                    # 其他實例在跑
+                    await asyncio.sleep(2)
+                    continue
 
-async def dealer_loop(room: str, seconds_per_round: int):
-    conn = _conn()
-    try:
-        dk = today_key()
-        current_no = get_last_round_no(conn, room, dk)
+                # 開新局（若需要）
+                info = current_round_info(cur, room)
+                if info is None or info["phase"] == "settled":
+                    rn = next_round_no(cur, room)
+                    cur.execute("""
+                      INSERT INTO rounds (day_key, room, round_no, phase)
+                      VALUES (%s, %s, %s, 'betting')
+                      ON CONFLICT (day_key, room, round_no) DO NOTHING;
+                    """, (today_key(), room, rn))
+                    conn.commit()
+                    info = current_round_info(cur, room)
 
-        while True:
-            # 跨日重置
-            if _midnight_changed(dk):
-                dk = today_key()
-                current_no = 0
+                # 更新房態
+                rn = info["round_no"]
+                _room_state[room] = {
+                    "round_no": rn,
+                    "phase": "betting",
+                    "deadline": taipei_now() + timedelta(seconds=BETTING_SECONDS[room]),
+                }
+            # betting 倒數
+            await asyncio.sleep(BETTING_SECONDS[room])
 
-            # 開新局
-            current_no += 1
-            open_round(conn, room, dk, current_no)
+            # 鎖單 -> 進入 reveal
+            with db() as conn, conn.cursor() as cur:
+                cur.execute("""
+                  UPDATE rounds
+                  SET phase='reveal'
+                  WHERE day_key=%s AND room=%s AND round_no=%s;
+                """, (today_key(), room, rn))
+                conn.commit()
+                _room_state[room]["phase"] = "reveal"
 
-            # 下注時段
-            lock_after = max(1, int(seconds_per_round * 0.7))
-            await asyncio.sleep(lock_after)
+            # 計算結果
+            p, b, pt, bt, p3, b3 = compute_baccarat_result()
+            outcome = "player" if pt > bt else ("banker" if bt > pt else "tie")
 
-            # 鎖單
-            lock_round(conn, room, dk, current_no)
+            # 儲存結果
+            with db() as conn, conn.cursor() as cur:
+                cur.execute("""
+                  UPDATE rounds
+                  SET player_total=%s, banker_total=%s,
+                      player_draw3=%s, banker_draw3=%s,
+                      outcome=%s
+                  WHERE day_key=%s AND room=%s AND round_no=%s;
+                """, (pt, bt, p3, b3, outcome, today_key(), room, rn))
+                conn.commit()
 
-            # 發牌結算
-            await asyncio.sleep(max(1, seconds_per_round - lock_after))
-            try:
-                settle_round(conn, room, dk, current_no)
-            except Exception as e:
-                print(f"[DEALER][{room}] settle error:", e)
+            # 給前端一段揭示時間
+            await asyncio.sleep(5)
 
-            # 緩衝
-            await asyncio.sleep(1)
-    except Exception as e:
-        print(f"[DEALER][{room}] loop crashed:", e)
-    finally:
-        conn.close()
+            # 結算（含和局 push）
+            with db() as conn, conn.cursor() as cur:
+                # 撈池子
+                pools, _ = room_pools(cur, room, rn)
+                # 結算每位下注者
+                # player 1:1, banker 0.95, tie 8:1；tie 時 player/banker 退回本金
+                cur.execute("""
+                  SELECT b.id, b.user_id, b.side, b.amount
+                  FROM bets b
+                  WHERE b.day_key=%s AND b.room=%s AND b.round_no=%s;
+                """, (today_key(), room, rn))
+                rows = cur.fetchall()
+                for r in rows:
+                    uid, side, amt = r["user_id"], r["side"], int(r["amount"])
+                    win = 0
+                    if outcome == "player":
+                        if side == "player": win = amt * 2
+                    elif outcome == "banker":
+                        if side == "banker": win = amt + int(amt * 0.95)
+                    else:  # tie
+                        if side == "tie": win = amt + amt * 8
+                        else: win = amt  # push
+
+                    if win > 0:
+                        cur.execute("UPDATE users SET balance = balance + %s WHERE id=%s;", (win, uid))
+                # 設定 settled
+                cur.execute("""
+                  UPDATE rounds SET phase='settled'
+                  WHERE day_key=%s AND room=%s AND round_no=%s;
+                """, (today_key(), room, rn))
+                conn.commit()
+
+            # 稍等 2 秒，再開下一局
+            await asyncio.sleep(2)
+
+        except Exception as e:
+            # 記錄錯誤但不中斷循環
+            print(f"[DEALER][{room}] error: {e}")
+            await asyncio.sleep(2)
 
 async def launch_all_rooms():
-    tasks = []
-    for r, sec in ROOMS.items():
-        tasks.append(asyncio.create_task(dealer_loop(r, sec)))
-    await asyncio.gather(*tasks)
+    # 每天 00:00(台北) 自動換日（靠 day_key），round_no 從 1 開始（由 next_round_no 計算）
+    await asyncio.gather(*(single_room_loop(r) for r in ROOMS))
+
+def current_room_state(room: str):
+    snap = get_state_snapshot(room)
+    # 附上池子統計
+    with db() as conn, conn.cursor() as cur:
+        rn = snap.get("round_no")
+        pools = {"player": 0, "banker": 0, "tie": 0}
+        bettors = 0
+        if rn:
+            pools, bettors = room_pools(cur, room, rn)
+        # 如果 phase=reveal/settled 取結果摘要
+        result = None
+        cur.execute("""
+          SELECT player_total, banker_total, player_draw3, banker_draw3, outcome
+          FROM rounds
+          WHERE day_key=%s AND room=%s AND round_no=%s;
+        """, (today_key(), room, rn or 0))
+        row = cur.fetchone()
+        if row and row["outcome"]:
+            result = {
+                "player_total": row["player_total"],
+                "banker_total": row["banker_total"],
+                "player_draw3": row["player_draw3"],
+                "banker_draw3": row["banker_draw3"],
+                "winner": row["outcome"],
+            }
+    snap["pools"] = pools
+    snap["bettors"] = bettors
+    snap["result"] = result
+    return snap

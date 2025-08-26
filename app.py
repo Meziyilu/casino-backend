@@ -1,75 +1,52 @@
 # app.py
 import os
 import asyncio
-import logging
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-log = logging.getLogger("uvicorn.error")
+APP_NAME = "TOPZ Casino Backend"
 
-app = FastAPI(title="TOPZ Casino Backend")
+def get_allowed_origins() -> list[str]:
+    raw = os.getenv("ALLOWED_ORIGINS", "")
+    if raw.strip():
+        return [o.strip() for o in raw.split(",") if o.strip()]
+    return [
+        "https://topz0705.com",
+        "https://casino-frontend-pya7.onrender.com",
+        "http://localhost:5173",
+    ]
 
-# ---- CORS：直接放行前端網域（避免憑證 + CORS 再卡）----
-ALLOWED = {
-    "https://topz0705.com",
-    "https://casino-frontend-pya7.onrender.com",
-    "http://localhost:5173",
-}
-# 若你也想保留環境變數方式，可一起納入
-_env = os.getenv("ALLOWED_ORIGINS", "")
-if _env.strip():
-    for o in _env.split(","):
-        o = o.strip()
-        if o:
-            ALLOWED.add(o)
+app = FastAPI(title=APP_NAME)
 
+# CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=list(ALLOWED),   # ⚠️ 不要用 "*"
+    allow_origins=get_allowed_origins(),  # ⚠️ 不能用 "*"
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ---- 掛載路由（先建 app 再 import router）----
-#   你的專案結構需有：
-#   auth/__init__.py, auth/api.py（內含 router）
-#   baccarat/__init__.py, baccarat/api.py, baccarat/sql.py, baccarat/service.py
+# 路由（注意順序：先建 app，再 import router）
 from auth.api import router as auth_router
-app.include_router(auth_router, prefix="/auth", tags=["auth"])
-
-# 百家樂路由（如果你先只想讓登入可用，也可以暫時註解掉下面兩行）
 from baccarat.api import router as baccarat_router
-app.include_router(baccarat_router, prefix="/baccarat", tags=["baccarat"])
+from baccarat.sql import ensure_schema
+from baccarat.service import launch_all_rooms
 
-# ---- 健康檢查 & 根路由 ----
-@app.get("/")
-def root():
-    return {"ok": True, "service": "TOPZ backend"}
+app.include_router(auth_router, prefix="/auth", tags=["auth"])
+app.include_router(baccarat_router, prefix="/baccarat", tags=["baccarat"])
 
 @app.get("/healthz")
 def healthz():
-    return {"ok": True, "cors": list(ALLOWED)}
+    return {"ok": True, "service": APP_NAME}
 
-# ---- 啟動：建表 & 啟動三房自動開局（失敗不影響 /auth）----
+@app.get("/")
+def root():
+    return {"ok": True, "service": APP_NAME}
+
 @app.on_event("startup")
 async def _boot():
-    # 建表
-    try:
-        from baccarat.sql import ensure_schema
-        ensure_schema()
-        log.info("[BOOT] ensure_schema OK")
-    except Exception as e:
-        log.error("[BOOT] ensure_schema failed: %s", e)
-
-    # 啟動 dealer 背景任務
-    async def _dealer_loop():
-        try:
-            from baccarat.service import launch_all_rooms
-            await launch_all_rooms()
-        except Exception as e:
-            # 不要讓例外把整個 App 掛掉
-            log.error("[DEALER] launch_all_rooms error: %s", e)
-
-    # 背景開，不阻塞 Auth
-    asyncio.create_task(_dealer_loop())
+    # 建表與索引（可重入）
+    ensure_schema()
+    # 啟動三房自動開局（advisory lock 確保單實例）
+    asyncio.create_task(launch_all_rooms())
