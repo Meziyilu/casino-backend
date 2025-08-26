@@ -7,16 +7,17 @@ from pydantic import BaseModel
 from typing import Optional
 import datetime
 
-APP_NAME = "Casino Auth + Lobby"
+APP_NAME = "Casino Auth + Lobby (Reset Clean)"
 DATABASE_URL = os.getenv("DATABASE_URL")
+if not DATABASE_URL:
+    raise RuntimeError("Missing DATABASE_URL")
 
-# ===== DB 連線 =====
+# ---------- DB ----------
 @contextmanager
 def get_conn():
     with psycopg.connect(DATABASE_URL, autocommit=False) as conn:
         yield conn
 
-# ===== 初始化資料庫 =====
 def init_db():
     with get_conn() as conn:
         with conn.cursor() as cur:
@@ -33,7 +34,7 @@ def init_db():
             """)
         conn.commit()
 
-# ===== FastAPI app =====
+# ---------- APP & CORS ----------
 app = FastAPI(title=APP_NAME)
 
 def get_allowed_origins() -> list[str]:
@@ -54,7 +55,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ===== Pydantic models =====
+# ---------- Models ----------
 class RegisterReq(BaseModel):
     username: str
     password: str
@@ -71,48 +72,61 @@ class UserOut(BaseModel):
     is_admin: bool
     created_at: datetime.datetime
 
-# ===== Auth APIs =====
+# ---------- Auth ----------
 @app.post("/auth/register")
 def register(body: RegisterReq):
+    un = body.username.strip().lower()
+    pw = body.password.strip()
+    if not un or not pw:
+        raise HTTPException(status_code=400, detail="username/password required")
     with get_conn() as conn:
         with conn.cursor() as cur:
             try:
                 cur.execute(
-                    "INSERT INTO users (username, password) VALUES (%s, %s) RETURNING id;",
-                    (body.username, body.password),
+                    "INSERT INTO users (username, password, nickname) VALUES (%s, %s, %s) RETURNING id;",
+                    (un, pw, un),
                 )
-                user_id = cur.fetchone()[0]
+                uid = cur.fetchone()[0]
+                conn.commit()
+                return {"ok": True, "id": uid, "username": un}
             except psycopg.errors.UniqueViolation:
+                conn.rollback()
                 raise HTTPException(status_code=409, detail="username already exists")
-        conn.commit()
-    return {"ok": True, "id": user_id}
 
 @app.post("/auth/login")
 def login(body: LoginReq):
+    un = body.username.strip().lower()
+    pw = body.password.strip()
     with get_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute("SELECT id, password FROM users WHERE username=%s;", (body.username,))
+            cur.execute("SELECT id, password FROM users WHERE username=%s;", (un,))
             row = cur.fetchone()
-            if not row:
+            if not row or row[1] != pw:
                 raise HTTPException(status_code=401, detail="invalid username or password")
-            if row[1] != body.password:
-                raise HTTPException(status_code=401, detail="invalid username or password")
-    return {"ok": True, "id": row[0], "username": body.username}
+            uid = row[0]
+    return {"ok": True, "id": uid, "username": un, "token": f"user-{uid}"}
 
 @app.get("/me", response_model=UserOut)
 def me(username: str):
     with get_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute("SELECT id, username, nickname, balance, is_admin, created_at FROM users WHERE username=%s;", (username,))
+            cur.execute("""
+              SELECT id, username, nickname, balance, is_admin, created_at
+              FROM users WHERE username=%s;
+            """, (username,))
             row = cur.fetchone()
             if not row:
                 raise HTTPException(status_code=404, detail="user not found")
     return UserOut(
         id=row[0], username=row[1], nickname=row[2],
-        balance=row[3], is_admin=row[4], created_at=row[5]
+        balance=int(row[3]), is_admin=bool(row[4]), created_at=row[5]
     )
 
-# ===== Admin API: Reset DB =====
+@app.get("/health")
+def health():
+    return {"ok": True, "name": APP_NAME, "allowed": get_allowed_origins()}
+
+# ---------- Admin: 一鍵清庫重建 ----------
 ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "").strip()
 
 def require_admin(authorization: str = Header(default="")):
@@ -124,15 +138,14 @@ def require_admin(authorization: str = Header(default="")):
 @app.post("/admin/reset-db")
 def admin_reset_db(_=Depends(require_admin)):
     """
-    ⚠️ 危險操作：清空舊資料 & 重建最小結構（users）。
-    會 DROP baccarat 表（rounds/bets），然後重建 users。
+    ⚠️ 不可逆：刪除 baccarat 相關表與 users 表，重建乾淨 users 表。
     """
     with get_conn() as conn:
         with conn.cursor() as cur:
-            # 1) 刪掉 baccarat 表
+            # 刪 baccarat 相關（存在才刪）
             cur.execute("DROP TABLE IF EXISTS bets CASCADE;")
             cur.execute("DROP TABLE IF EXISTS rounds CASCADE;")
-            # 2) 重建 users
+            # 刪 users 並重建
             cur.execute("DROP TABLE IF EXISTS users CASCADE;")
             cur.execute("""
             CREATE TABLE IF NOT EXISTS users (
@@ -146,9 +159,8 @@ def admin_reset_db(_=Depends(require_admin)):
             );
             """)
         conn.commit()
-    return {"ok": True, "message": "database reset to auth-only schema"}
+    return {"ok": True, "message": "database reset to clean users-only schema"}
 
-# ===== 啟動時初始化 =====
 @app.on_event("startup")
 def on_startup():
     init_db()
