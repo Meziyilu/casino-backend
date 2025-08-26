@@ -174,3 +174,107 @@ async def scheduler():
             await sleep(1)
     import asyncio
     asyncio.create_task(loop())
+# === 加在檔案頂部 if 沒有的話 ===
+from fastapi import Header, Depends
+from pydantic import BaseModel
+from typing import Optional
+
+ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "").strip()
+
+# === 小工具：驗證管理權限 ===
+def require_admin(authorization: Optional[str] = Header(None)):
+    token = (authorization or "").split(" ", 1)
+    supplied = token[1] if len(token) == 2 and token[0].lower() == "bearer" else (authorization or "")
+    if not ADMIN_TOKEN or supplied != ADMIN_TOKEN:
+        # 也允許用 query ?token=... 傳；可自行移除
+        # from fastapi import Request
+        # if request.query_params.get("token") == ADMIN_TOKEN: return
+        raise HTTPException(status_code=401, detail="unauthorized")
+
+# === 執行多條 SQL 的工具 ===
+def run_sql_list(cur, stmts: list[str]):
+    results = []
+    for s in stmts:
+        if not s.strip():
+            continue
+        cur.execute(s)
+        results.append(s.split("\n", 1)[0].strip())
+    return results
+
+# === 請求模型 ===
+class FixRoundsReq(BaseModel):
+    cleanup: Optional[str] = "none"  # "none" | "today" | "all"
+
+# === 管理 API：一鍵修復 rounds 索引/約束 +（可選）清理資料 ===
+@app.post("/admin/fix-rounds")
+def admin_fix_rounds(body: FixRoundsReq, _=Depends(require_admin)):
+    """
+    修復內容：
+    1) 刪除只鎖 round_no 的唯一索引/約束（避免跨房/跨日衝突）
+    2) 補上 day_key（台北時區日期）與缺失的 room 值
+    3) 建立正確的複合唯一索引 (room, day_key, round_no)
+    4) （可選）清理舊資料：cleanup=none/today/all
+    """
+    executed = []
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            # 1) 刪舊索引（log 顯示為 idx_rounds_round_no）
+            stmts = [
+                "DROP INDEX IF EXISTS idx_rounds_round_no;",
+                # 若當初被建立成 UNIQUE CONSTRAINT（名字不一定），掃描並移除任何含 round_no 的唯一約束
+                """
+                DO $$
+                DECLARE
+                  cons_name text;
+                BEGIN
+                  SELECT conname INTO cons_name
+                  FROM pg_constraint
+                  WHERE conrelid = 'rounds'::regclass
+                    AND contype = 'u'
+                    AND conname ILIKE '%round_no%';
+                  IF cons_name IS NOT NULL THEN
+                    EXECUTE format('ALTER TABLE rounds DROP CONSTRAINT %I', cons_name);
+                  END IF;
+                END $$;
+                """,
+                # 2) 補 day_key（以台北時間的日期），補缺失 room
+                """
+                UPDATE rounds
+                   SET day_key = (opened_at AT TIME ZONE 'Asia/Taipei')::date
+                 WHERE day_key IS NULL;
+                """,
+                "UPDATE rounds SET room = 'room1' WHERE room IS NULL;",
+                "UPDATE bets   SET room = 'room1' WHERE room IS NULL;",
+                # 3) 建立正確複合唯一索引
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS uniq_round_room_day_no
+                  ON rounds (room, day_key, round_no);
+                """
+            ]
+            executed += run_sql_list(cur, stmts)
+
+            # 4) 可選清理
+            if body.cleanup == "all":
+                executed += run_sql_list(cur, [
+                    "TRUNCATE bets RESTART IDENTITY CASCADE;",
+                    "TRUNCATE rounds RESTART IDENTITY CASCADE;"
+                ])
+            elif body.cleanup == "today":
+                executed += run_sql_list(cur, [
+                    """
+                    DELETE FROM bets
+                     WHERE created_at::date < (now() AT TIME ZONE 'Asia/Taipei')::date;
+                    """,
+                    """
+                    DELETE FROM rounds
+                     WHERE day_key < (now() AT TIME ZONE 'Asia/Taipei')::date;
+                    """
+                ])
+
+        conn.commit()
+
+    return {
+        "ok": True,
+        "cleanup": body.cleanup,
+        "executed": executed
+    }
